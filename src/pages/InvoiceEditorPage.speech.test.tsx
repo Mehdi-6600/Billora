@@ -2,7 +2,8 @@
 import { act } from 'react'
 import { createRoot, type Root } from 'react-dom/client'
 import { afterEach, describe, expect, it, vi } from 'vitest'
-import { blankInvoiceForm } from '../domain/invoice-form'
+import { blankInvoiceForm, type InvoiceForm } from '../domain/invoice-form'
+import type { Product } from '../domain/types'
 import type {
   SpeechErrorEventLike,
   SpeechRecognitionLike,
@@ -31,12 +32,14 @@ class MockRecognition implements SpeechRecognitionLike {
   stop() { this.stopCalls += 1 }
   abort() { this.abortCalls += 1 }
   emitStart() { this.onstart?.(new Event('start')) }
+  emitEnd() { this.onend?.(new Event('end')) }
   emitResult(transcript: string) {
     const alternative = { transcript }
     const result = { 0: alternative, length: 1 }
     const results = { 0: result, length: 1 }
     this.onresult?.({ results })
   }
+  emitError(error: string) { this.onerror?.({ error }) }
 }
 
 const originalSpeechDescriptor = Object.getOwnPropertyDescriptor(window, 'SpeechRecognition')
@@ -51,13 +54,13 @@ function setSpeechConstructors(standard?: Window['SpeechRecognition'], webkit?: 
   else delete window.webkitSpeechRecognition
 }
 
-function renderEditor() {
+function renderEditor(products: Product[] = []) {
   mountedContainer = document.createElement('div')
   document.body.appendChild(mountedContainer)
   mountedRoot = createRoot(mountedContainer)
   const props = {
     form: blankInvoiceForm(),
-    products: [],
+    products,
     saving: false,
     hasSaved: false,
     onChange: vi.fn(),
@@ -110,21 +113,122 @@ describe('ورود گفتاری در فرم فاکتور', () => {
     expect(props.onDeleteProduct).not.toHaveBeenCalled()
   })
 
-  it('در مرورگر فاقد API پیام می‌دهد و ورودی دستی همچنان قابل استفاده است', () => {
-    setSpeechConstructors()
+  it('transcript فارسی را پس از بازبینی ویرایش‌شده از همان مسیر دکمهٔ اجرای دستور عبور می‌دهد', () => {
+    const rice: Product = {
+      id: 'rice-hashemi',
+      name: 'برنج هاشمی',
+      unit: 'کیسه',
+      price: 1_250_000,
+      createdAt: '2026-01-01',
+      updatedAt: '2026-01-01',
+    }
+    setSpeechConstructors(MockRecognition)
+    const { container, props } = renderEditor([rice])
+    const micButton = container.querySelector<HTMLButtonElement>('.voice-button')!
+    act(() => { micButton.dispatchEvent(new MouseEvent('click', { bubbles: true })) })
+    const recognition = MockRecognition.instances[0]
+    const transcript = 'دو کیسه برنج هاشمی به فاکتور اضافه کن'
+    act(() => {
+      recognition.emitStart()
+      recognition.emitResult(transcript)
+    })
+
+    const input = container.querySelector<HTMLInputElement>('[aria-label="نوشتن دستور فارسی"]')!
+    expect(input.value).toBe(transcript)
+    expect(input.disabled).toBe(false)
+    expect(props.onChange).not.toHaveBeenCalled()
+
+    // The transcript stays editable; punctuation is a harmless user edit for this command.
+    const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value')?.set
+    act(() => {
+      setter?.call(input, `${transcript}؟`)
+      input.dispatchEvent(new Event('input', { bubbles: true }))
+    })
+    expect(input.value).toBe(`${transcript}؟`)
+    expect(props.onChange).not.toHaveBeenCalled()
+
+    act(() => { container.querySelector<HTMLButtonElement>('.command-run')?.click() })
+    expect(props.onChange).toHaveBeenCalledTimes(1)
+    const updatedForm = props.onChange.mock.calls[0][0] as InvoiceForm
+    expect(updatedForm.items).toHaveLength(1)
+    expect(updatedForm.items[0]).toMatchObject({
+      productId: 'rice-hashemi',
+      name: 'برنج هاشمی',
+      unit: 'کیسه',
+      quantity: '2',
+      unitPrice: '1250000',
+    })
+    expect(props.onSave).not.toHaveBeenCalled()
+  })
+
+  it('متن خالی، دستور ناشناخته و خطای سرویس را با پیام‌های جدا نشان می‌دهد', () => {
+    setSpeechConstructors(MockRecognition)
     const { container } = renderEditor()
+    const micButton = container.querySelector<HTMLButtonElement>('.voice-button')!
+    const commandInput = container.querySelector<HTMLInputElement>('[aria-label="نوشتن دستور فارسی"]')!
+    const commandRunButton = container.querySelector<HTMLButtonElement>('.command-run')!
+    const feedback = () => container.querySelector<HTMLElement>('[role="status"]')?.textContent ?? ''
+
+    act(() => { micButton.dispatchEvent(new MouseEvent('click', { bubbles: true })) })
+    const firstRecognition = MockRecognition.instances[0]
+    act(() => {
+      firstRecognition.emitStart()
+      firstRecognition.emitResult('   ')
+    })
+    expect(feedback()).toContain('متن قابل‌فهمی از گفتار دریافت نشد')
+    expect(feedback()).not.toContain('این دستور را نمی‌شناسم')
+
+    act(() => { commandRunButton.click() })
+    expect(feedback()).toContain('متنی برای پردازش دریافت نشد')
+    expect(feedback()).not.toContain('این دستور را نمی‌شناسم')
+
+    const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value')?.set
+    act(() => {
+      setter?.call(commandInput, 'این دستور ناشناخته است')
+      commandInput.dispatchEvent(new Event('input', { bubbles: true }))
+    })
+    act(() => { commandRunButton.click() })
+    expect(feedback()).toContain('این دستور را نمی‌شناسم')
+
+    act(() => { firstRecognition.emitEnd() })
+    act(() => { micButton.dispatchEvent(new MouseEvent('click', { bubbles: true })) })
+    const secondRecognition = MockRecognition.instances[1]
+    act(() => { secondRecognition.emitError('network') })
+    expect(feedback()).toContain('سرویس تشخیص گفتار به شبکه وصل نشد')
+    expect(feedback()).not.toContain('این دستور را نمی‌شناسم')
+    expect(feedback()).not.toContain('متنی برای پردازش دریافت نشد')
+  })
+
+  it('در مرورگر فاقد API پیام می‌دهد و دستور تایپی همچنان از همان موتور اجرا می‌شود', () => {
+    const rice: Product = {
+      id: 'rice-hashemi',
+      name: 'برنج هاشمی',
+      unit: 'کیسه',
+      price: 1_250_000,
+      createdAt: '2026-01-01',
+      updatedAt: '2026-01-01',
+    }
+    setSpeechConstructors()
+    const { container, props } = renderEditor([rice])
     const micButton = container.querySelector<HTMLButtonElement>('[aria-label="گفتن دستور با میکروفن"]')!
     act(() => { micButton.dispatchEvent(new MouseEvent('click', { bubbles: true })) })
 
     const input = container.querySelector<HTMLInputElement>('[aria-label="نوشتن دستور فارسی"]')!
     expect(container.textContent).toContain('این مرورگر Web Speech API را پشتیبانی نمی‌کند')
     expect(input.disabled).toBe(false)
+    const typedCommand = 'دو کیسه برنج هاشمی به فاکتور اضافه کن'
     const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value')?.set
     act(() => {
-      setter?.call(input, 'دستور تایپی فارسی')
+      setter?.call(input, typedCommand)
       input.dispatchEvent(new Event('input', { bubbles: true }))
     })
-    expect(input.value).toBe('دستور تایپی فارسی')
+    expect(input.value).toBe(typedCommand)
+    expect(props.onChange).not.toHaveBeenCalled()
+
+    act(() => { container.querySelector<HTMLButtonElement>('.command-run')?.click() })
+    expect(props.onChange).toHaveBeenCalledTimes(1)
+    const updatedForm = props.onChange.mock.calls[0][0] as InvoiceForm
+    expect(updatedForm.items[0]).toMatchObject({ productId: 'rice-hashemi', quantity: '2' })
   })
 
   it('در خروج از فرم نشست گفتار را لغو می‌کند', () => {

@@ -75,7 +75,7 @@ export function parseCommand(input: string): ParsedCommand | null {
   const addMatch = text.match(/^([^\s]+)\s+(.+?)\s+به\s+فاکتور\s+اضافه\s+کن$/)
   if (addMatch) {
     const quantity = parseCommandNumber(addMatch[1])
-    const productName = cleanProductName(addMatch[2].replace(/^(?:عدد|دانه|بسته|کیلو|کیلوگرم|لیتر)\s+/, ''))
+    const productName = cleanProductName(addMatch[2].replace(/^(?:عدد|دانه|بسته|کیسه|کیلو|کیلوگرم|لیتر)\s+/, ''))
     if (quantity !== null && quantity > 0 && productName) {
       return { type: 'addInvoiceItem', productName, quantity }
     }

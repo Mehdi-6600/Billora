@@ -11,6 +11,14 @@ describe('دستورهای فارسیِ صریح و محلی', () => {
     expect(parseCommand(input)).toEqual(expected)
   })
 
+  it('واحد «کیسه» را از نام محصول جدا می‌کند و همان تعداد فارسی را می‌خواند', () => {
+    expect(parseCommand('دو کیسه برنج هاشمی به فاکتور اضافه کن')).toEqual({
+      type: 'addInvoiceItem',
+      productName: 'برنج هاشمی',
+      quantity: 2,
+    })
+  })
+
   it('اعداد عربی و صورت بی‌نام «این محصول» را تشخیص می‌دهد', () => {
     expect(parseCommand('قیمت روغن را ١٠ درصد افزایش بده')).toMatchObject({ percent: 10, direction: 'increase' })
     expect(parseCommand('این محصول را حذف کن')).toEqual({ type: 'deleteProduct', productName: '' })
