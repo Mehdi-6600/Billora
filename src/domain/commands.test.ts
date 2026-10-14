@@ -19,6 +19,14 @@ describe('دستورهای فارسیِ صریح و محلی', () => {
     })
   })
 
+  it('واحد «عدد» را از نام محصول جدا می‌کند و «دو عدد برنج هاشمی» را با تعداد ۲ می‌خواند', () => {
+    expect(parseCommand('دو عدد برنج هاشمی به فاکتور اضافه کن')).toEqual({
+      type: 'addInvoiceItem',
+      productName: 'برنج هاشمی',
+      quantity: 2,
+    })
+  })
+
   it('اعداد عربی و صورت بی‌نام «این محصول» را تشخیص می‌دهد', () => {
     expect(parseCommand('قیمت روغن را ١٠ درصد افزایش بده')).toMatchObject({ percent: 10, direction: 'increase' })
     expect(parseCommand('این محصول را حذف کن')).toEqual({ type: 'deleteProduct', productName: '' })

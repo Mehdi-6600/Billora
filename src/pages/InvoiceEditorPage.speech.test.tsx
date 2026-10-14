@@ -199,6 +199,73 @@ describe('ورود گفتاری در فرم فاکتور', () => {
     expect(feedback()).not.toContain('متنی برای پردازش دریافت نشد')
   })
 
+  it.each([
+    ['دو عدد برنج هاشمی به فاکتور اضافه کن'],
+    ['دو کیسه برنج هاشمی به فاکتور اضافه کن'],
+  ])('«%s» را فقط پس از اجرای دستی به فاکتور می‌افزاید و ردیف‌های قبلی را دست‌نخورده نگه می‌دارد', (transcript) => {
+    const rice: Product = {
+      id: 'rice-hashemi',
+      name: 'برنج هاشمی',
+      unit: 'کیسه',
+      price: 1_250_000,
+      createdAt: '2026-01-01',
+      updatedAt: '2026-01-01',
+    }
+    const existingRows = [
+      { id: 'row-milk', productId: null, name: 'شیر', unit: 'عدد', quantity: '1', unitPrice: '25000', discountPercent: '0' },
+      { id: 'row-oil', productId: 'oil-1', name: 'روغن', unit: 'بطری', quantity: '4', unitPrice: '1000', discountPercent: '5' },
+    ]
+    setSpeechConstructors(MockRecognition)
+    mountedContainer = document.createElement('div')
+    document.body.appendChild(mountedContainer)
+    mountedRoot = createRoot(mountedContainer)
+    const props = {
+      form: { ...blankInvoiceForm(), items: existingRows },
+      products: [rice],
+      saving: false,
+      hasSaved: false,
+      onChange: vi.fn(),
+      onSave: vi.fn().mockResolvedValue(undefined),
+      onBack: vi.fn(),
+      onPrint: vi.fn(),
+      onUpdateProduct: vi.fn().mockResolvedValue(undefined),
+      onDeleteProduct: vi.fn().mockResolvedValue(undefined),
+      onNotify: vi.fn(),
+    }
+    act(() => { mountedRoot?.render(<InvoiceEditorPage {...props} />) })
+    const container = mountedContainer
+
+    act(() => { container.querySelector<HTMLButtonElement>('.voice-button')!.dispatchEvent(new MouseEvent('click', { bubbles: true })) })
+    const recognition = MockRecognition.instances[0]
+    act(() => {
+      recognition.emitStart()
+      recognition.emitResult(transcript)
+    })
+
+    // Speech output alone must not touch the invoice, catalog, or storage.
+    expect(container.querySelector<HTMLInputElement>('[aria-label="نوشتن دستور فارسی"]')?.value).toBe(transcript)
+    expect(props.onChange).not.toHaveBeenCalled()
+    expect(props.onSave).not.toHaveBeenCalled()
+    expect(props.onUpdateProduct).not.toHaveBeenCalled()
+    expect(props.onDeleteProduct).not.toHaveBeenCalled()
+
+    act(() => { container.querySelector<HTMLButtonElement>('.command-run')?.click() })
+    expect(props.onChange).toHaveBeenCalledTimes(1)
+    const updatedForm = props.onChange.mock.calls[0][0] as InvoiceForm
+    expect(updatedForm.items).toHaveLength(3)
+    expect(updatedForm.items.slice(0, 2)).toEqual(existingRows)
+    expect(updatedForm.items[2]).toMatchObject({
+      productId: 'rice-hashemi',
+      name: 'برنج هاشمی',
+      unit: 'کیسه',
+      quantity: '2',
+      unitPrice: '1250000',
+    })
+    expect(props.onSave).not.toHaveBeenCalled()
+    expect(props.onUpdateProduct).not.toHaveBeenCalled()
+    expect(props.onDeleteProduct).not.toHaveBeenCalled()
+  })
+
   it('در مرورگر فاقد API پیام می‌دهد و دستور تایپی همچنان از همان موتور اجرا می‌شود', () => {
     const rice: Product = {
       id: 'rice-hashemi',
