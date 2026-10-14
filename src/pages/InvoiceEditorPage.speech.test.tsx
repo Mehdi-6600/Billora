@@ -408,3 +408,124 @@ describe('دکمهٔ گفتار: توقف، بازیابی و خطای دستو�
     expect(props.onChange).not.toHaveBeenCalled()
   })
 })
+
+describe('کلیک دوم روی «توقف» و خروج رابط از حالت شنیدن', () => {
+  const voiceButton = (container: HTMLElement) => container.querySelector<HTMLButtonElement>('.voice-button')!
+  const press = (element: HTMLElement) => act(() => { element.dispatchEvent(new MouseEvent('click', { bubbles: true })) })
+  const feedback = (container: HTMLElement) => container.querySelector<HTMLElement>('[role="status"]')?.textContent ?? ''
+  const isListening = (container: HTMLElement) => voiceButton(container).classList.contains('listening')
+  const isIdle = (container: HTMLElement) => voiceButton(container).getAttribute('aria-label') === 'گفتن دستور با میکروفن'
+
+  class ThrowingStartRecognition extends MockRecognition {
+    override start() { throw { name: 'NotAllowedError' } }
+  }
+
+  it('دقیقاً همان توالی باگ: شنیدن → کلیک دوم «توقف» → onstart دیرهنگام → کلیک سوم لغو می‌کند و رابط آماده می‌شود', () => {
+    setSpeechConstructors(MockRecognition)
+    const { container } = renderEditor()
+    press(voiceButton(container))
+    const recognition = MockRecognition.instances[0]
+    act(() => { recognition.emitStart() })
+    expect(voiceButton(container).textContent).toContain('توقف')
+    expect(isListening(container)).toBe(true)
+
+    press(voiceButton(container))
+    expect(recognition.stopCalls).toBe(1)
+    expect(voiceButton(container).textContent).toContain('در حال توقف')
+    expect(isListening(container)).toBe(false)
+
+    // The browser reports `start` after the stop request: the UI must not go back to red «توقف».
+    act(() => { recognition.emitStart() })
+    expect(isListening(container)).toBe(false)
+    expect(voiceButton(container).textContent).not.toBe('توقف')
+    expect(feedback(container)).toContain('هنوز ممکن است فعال باشد')
+
+    // The browser never sends `end`: the next press must end the session on the same instance.
+    press(voiceButton(container))
+    expect(recognition.abortCalls).toBe(1)
+    expect(isListening(container)).toBe(false)
+    expect(voiceButton(container).textContent).not.toContain('در حال توقف')
+    expect(isIdle(container)).toBe(true)
+  })
+
+  it('onend دیرهنگام از نشست لغوشده، نشست تازهٔ بعدی را تغییر نمی‌دهد', () => {
+    setSpeechConstructors(MockRecognition)
+    const { container } = renderEditor()
+    press(voiceButton(container))
+    const first = MockRecognition.instances[0]
+    act(() => { first.emitStart() })
+    press(voiceButton(container))
+    press(voiceButton(container))
+    expect(first.abortCalls).toBe(1)
+
+    press(voiceButton(container))
+    const second = MockRecognition.instances[1]
+    expect(second.startCalls).toBe(1)
+    expect(voiceButton(container).textContent).toContain('آماده‌سازی')
+
+    act(() => { first.emitEnd() })
+    act(() => { first.emitResult('دو عدد برنج هاشمی به فاکتور اضافه کن') })
+    expect(voiceButton(container).textContent).toContain('آماده‌سازی')
+    expect(container.querySelector<HTMLInputElement>('[aria-label="نوشتن دستور فارسی"]')?.value).toBe('')
+
+    act(() => { second.emitStart() })
+    expect(isListening(container)).toBe(true)
+  })
+
+  it('نتیجهٔ دیرهنگام پس از توقف در فیلد می‌نشیند و onend بعدی وضعیت بازبینی را پاک نمی‌کند', () => {
+    setSpeechConstructors(MockRecognition)
+    const { container, props } = renderEditor()
+    press(voiceButton(container))
+    const recognition = MockRecognition.instances[0]
+    act(() => { recognition.emitStart() })
+    press(voiceButton(container))
+    act(() => { recognition.emitResult('دو کیسه برنج هاشمی به فاکتور اضافه کن') })
+    act(() => { recognition.emitEnd() })
+    expect(container.querySelector<HTMLInputElement>('[aria-label="نوشتن دستور فارسی"]')?.value).toBe('دو کیسه برنج هاشمی به فاکتور اضافه کن')
+    expect(voiceButton(container).getAttribute('aria-label')).toBe('شروع دوبارهٔ تشخیص گفتار')
+    expect(isListening(container)).toBe(false)
+    expect(props.onChange).not.toHaveBeenCalled()
+  })
+
+  it('خطای شبکه هنگام توقف، دکمه را از حالت شنیدن خارج و خطا را گزارش می‌کند، نه پیام دستور', () => {
+    setSpeechConstructors(MockRecognition)
+    const { container, props } = renderEditor()
+    press(voiceButton(container))
+    const recognition = MockRecognition.instances[0]
+    act(() => { recognition.emitStart() })
+    press(voiceButton(container))
+    act(() => { recognition.emitError('network') })
+    expect(isListening(container)).toBe(false)
+    expect(voiceButton(container).classList.contains('speech-error')).toBe(true)
+    expect(feedback(container)).toContain('سرویس تشخیص گفتار به شبکه وصل نشد')
+    expect(feedback(container)).not.toContain('نمی‌شناسم')
+    act(() => { recognition.emitEnd() })
+    expect(voiceButton(container).classList.contains('speech-error')).toBe(true)
+    expect(props.onChange).not.toHaveBeenCalled()
+  })
+
+  it('شروع ناموفق با NotAllowedError دکمه را در حالت شنیدن نگه نمی‌دارد', () => {
+    setSpeechConstructors(ThrowingStartRecognition)
+    const { container } = renderEditor()
+    press(voiceButton(container))
+    expect(isListening(container)).toBe(false)
+    expect(voiceButton(container).classList.contains('speech-error')).toBe(true)
+    expect(voiceButton(container).getAttribute('aria-label')).toBe('تلاش دوباره برای تشخیص گفتار')
+    expect(feedback(container)).toContain('مجاز ندانست')
+    expect(feedback(container)).not.toContain('نمی‌شناسم')
+  })
+
+  it('اگر onstart هرگز نیاید، کلیک دوم و سوم هر دو نشست را می‌بندند و رابط گیر نمی‌کند', () => {
+    setSpeechConstructors(MockRecognition)
+    const { container } = renderEditor()
+    press(voiceButton(container))
+    const recognition = MockRecognition.instances[0]
+    expect(voiceButton(container).textContent).toContain('آماده‌سازی')
+    press(voiceButton(container))
+    expect(recognition.stopCalls).toBe(1)
+    press(voiceButton(container))
+    expect(recognition.abortCalls).toBe(1)
+    expect(isIdle(container)).toBe(true)
+    expect(isListening(container)).toBe(false)
+  })
+})

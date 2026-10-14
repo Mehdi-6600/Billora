@@ -179,8 +179,13 @@ export class PersianSpeechSession {
 
       recognition.onstart = () => {
         if (!this.isCurrent(recognition)) return
-        // A stop requested while 'starting' must not be undone by a late `start` event.
-        if (this.currentStatus !== 'starting') return
+        // A late `start` after a stop request must not revive the listening UI, but the browser may still hold the microphone.
+        if (this.currentStatus !== 'starting') {
+          if (this.currentStatus === 'stopping') {
+            this.publishMessage('میکروفن هنوز ممکن است فعال باشد؛ اگر پایان نیامد، دوباره دکمه را بزنید تا لغو شود.')
+          }
+          return
+        }
         this.publishStatus('listening')
         this.publishMessage('در حال شنیدن… پس از نمایش متن، آن را بررسی کنید.')
       }
