@@ -359,6 +359,8 @@ button:disabled { cursor: not-allowed !important; opacity: .6; }
 .voice-button { display: inline-flex; align-items: center; justify-content: center; gap: 5px; min-width: 69px; height: 39px; padding: 0 9px; color: #6d7d73; background: #fff; border: 1px solid #e5eae4; border-radius: 8px; cursor: pointer; font-size: 9px; }
 .voice-button:hover { color: var(--green-800); background: #f5f9f5; }
 .voice-button.listening { color: #b44c4b; background: #fff3f1; border-color: #f2d1ce; }
+.voice-button.speech-error { color: #a94743; background: #fff5f3; border-color: #f1d8d5; }
+.voice-button.speech-complete { color: #347c64; background: #f0f8f3; border-color: #d8eae0; }
 .voice-disclaimer { margin: 8px 0 0; color: #9da7a0; font-size: 8px; line-height: 1.8; }
 .command-feedback { display: flex; align-items: flex-start; gap: 7px; margin-top: 10px; padding: 9px 10px; color: #65766c; background: #f5f8f5; border: 1px solid #ebf0ea; border-radius: 8px; font-size: 9px; line-height: 1.8; }
 .command-feedback svg { flex: 0 0 15px; margin-top: 1px; color: #5e927e; }
