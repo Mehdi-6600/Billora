@@ -152,7 +152,8 @@ export function InvoiceEditorPage({
     }
     const command = parseCommand(commandText)
     if (!command) {
-      setCommandMessage('این دستور را نمی‌شناسم. از یکی از نمونه‌های پایین استفاده کنید یا نام و عدد را واضح‌تر بنویسید.')
+      // Show the exact text the parser received so a misheard phrase is visible, not hidden as a generic failure.
+      setCommandMessage(`این دستور را نمی‌شناسم: «${commandText.trim()}». از یکی از نمونه‌های پایین استفاده کنید یا نام و عدد را واضح‌تر بنویسید.`)
       return
     }
 

@@ -140,10 +140,15 @@ export class PersianSpeechSession {
   start(): boolean {
     if (this.disposed) return false
     if (this.recognition) {
-      this.publishMessage(this.currentStatus === 'stopping'
-        ? 'در حال توقف نشست قبلی هستیم؛ پس از پایان دوباره تلاش کنید.'
-        : 'تشخیص گفتار از قبل در حال اجراست. ابتدا همان نشست را متوقف کنید.')
-      return false
+      if (openStatuses.has(this.currentStatus)) {
+        this.publishMessage(this.currentStatus === 'stopping'
+          ? 'در حال توقف نشست قبلی هستیم؛ برای لغو، دوباره دکمه را بزنید.'
+          : 'تشخیص گفتار از قبل در حال اجراست. ابتدا همان نشست را متوقف کنید.')
+        return false
+      }
+      // The previous instance already produced its result (or failed) but the browser has not reported `end` yet.
+      // Retire that instance through the API so the user is never locked out, then start a fresh one.
+      this.retire(this.recognition)
     }
 
     const Recognition = getSpeechRecognitionConstructor(this.host)
@@ -174,6 +179,8 @@ export class PersianSpeechSession {
 
       recognition.onstart = () => {
         if (!this.isCurrent(recognition)) return
+        // A stop requested while 'starting' must not be undone by a late `start` event.
+        if (this.currentStatus !== 'starting') return
         this.publishStatus('listening')
         this.publishMessage('در حال شنیدن… پس از نمایش متن، آن را بررسی کنید.')
       }
@@ -223,10 +230,21 @@ export class PersianSpeechSession {
     }
   }
 
+  /**
+   * First press asks the browser to stop and keep its result.
+   * A second press while the browser has not reported `end` escalates to `abort()` on the same instance:
+   * the session is discarded, handlers are detached, and the UI returns to idle without waiting for an event that may never come.
+   */
   stop(): boolean {
     const recognition = this.recognition
     if (!recognition || this.disposed) return false
-    if (this.currentStatus === 'stopping') return false
+
+    if (this.currentStatus === 'stopping') {
+      this.retire(recognition)
+      this.publishStatus('idle')
+      this.publishMessage('ضبط لغو شد؛ متنی ثبت نشد.')
+      return true
+    }
 
     this.publishStatus('stopping')
     this.publishMessage('در حال توقف تشخیص گفتار…')
@@ -234,9 +252,7 @@ export class PersianSpeechSession {
       recognition.stop()
       return true
     } catch (error) {
-      if (this.recognition === recognition) this.recognition = null
-      this.clearHandlers(recognition)
-      try { recognition.abort?.() } catch { /* stop() may have run after the user agent already ended. */ }
+      this.retire(recognition)
       this.publishStatus('error')
       this.publishMessage(speechStartErrorMessage(error))
       return false
@@ -267,6 +283,18 @@ export class PersianSpeechSession {
     this.recognition = null
     this.clearHandlers(recognition)
     if (!cancelNative) return
+    try {
+      if (recognition.abort) recognition.abort()
+      else recognition.stop()
+    } catch {
+      // The user agent may already have ended the native session.
+    }
+  }
+
+  /** Detach handlers first so late browser events cannot touch the UI, then abort the native instance. */
+  private retire(recognition: SpeechRecognitionLike): void {
+    if (this.recognition === recognition) this.recognition = null
+    this.clearHandlers(recognition)
     try {
       if (recognition.abort) recognition.abort()
       else recognition.stop()
