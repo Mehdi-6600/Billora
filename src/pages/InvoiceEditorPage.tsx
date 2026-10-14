@@ -344,7 +344,7 @@ export function InvoiceEditorPage({
           <button type="button" className={`voice-button${listening ? ' listening' : ''}`} onClick={listening ? () => recognitionRef.current?.stop() : startListening} aria-label={listening ? 'توقف ضبط' : 'گفتن دستور با میکروفن'} title="تشخیص گفتار مرورگر؛ آفلاین تضمین نمی‌شود">{listening ? <MicOff size={17} /> : <Mic size={17} />}<span>{listening ? 'توقف' : 'گفتار'}</span></button>
           <button type="button" className="button button-primary command-run" onClick={runCommand}>اجرای دستور</button>
         </div>
-        <p className="voice-disclaimer">تشخیص گفتار فقط به Web Speech API مرورگر وابسته است؛ پشتیبانی فارسی و کارکرد آفلاین تضمین نمی‌شود و ممکن است به اینترنت یا مجوز میکروفن نیاز داشته باشد. متن شنیده‌شده خودکار اجرا نمی‌شود.</p>
+        <p className="voice-disclaimer">تشخیص گفتار فقط به Web Speech API مرورگر وابسته است؛ پشتیبانی فارسی و کارکرد آفلاین تضمین نمی‌شود و ممکن است به اینترنت یا مجوز میکروفن نیاز داشته باشد. بعضی مرورگرها صدا را برای پردازش به سرویس گفتار خود می‌فرستند. متن شنیده‌شده خودکار اجرا نمی‌شود.</p>
         {commandMessage && <div className="command-feedback" role="status"><CircleHelp size={16} />{commandMessage}</div>}
         <div className="command-examples"><span>نمونه‌ها:</span>{supportedCommandExamples.map((example) => <button type="button" key={example} onClick={() => { setCommandText(example); setCommandMessage('') }}>{example}</button>)}</div>
 
