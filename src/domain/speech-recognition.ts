@@ -56,9 +56,14 @@ export function speechErrorMessage(code: string): { status: 'idle' | 'error'; me
         message: 'اجازهٔ میکروفن یا تشخیص گفتار رد شد. در تنظیمات Safari برای این وب‌سایت دسترسی Microphone را روی Ask یا Allow بگذارید و دوباره تلاش کنید.',
       }
     case 'service-not-allowed':
+      // WebKit reports this before any per-site prompt when the speech service is not available for the requested
+      // language (for example fa-IR), or when the speech service itself is disabled. It is not a microphone permission.
       return {
         status: 'error',
-        message: 'Safari اجازهٔ استفاده از سرویس تشخیص گفتار را نداد. تنظیمات دسترسی سایت و محدودیت‌های Screen Time را بررسی کنید.',
+        message: 'سرویس تشخیص گفتار Safari برای فارسی یا در این دستگاه در دسترس نیست (کد: service-not-allowed). '
+          + 'این خطا به مجوز میکروفن مربوط نیست. دلیل‌های ممکن: Safari برای فارسی سرویس گفتار ندارد، '
+          + 'یا Siri و Dictation غیرفعال یا محدود شده‌اند، یا دسترسی Speech Recognition برای Safari بسته است. '
+          + 'دستور را تایپ کنید؛ پردازش دستورهای فارسی بدون گفتار کار می‌کند.',
       }
     case 'audio-capture':
       return {

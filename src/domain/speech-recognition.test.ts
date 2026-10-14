@@ -293,3 +293,48 @@ describe('چرخهٔ توقف، پایان و بازیابی نشست', () => {
     expect(session.start()).toBe(true)
   })
 })
+
+describe('تشخیص خطای سرویس گفتار از خطای مجوز و خطای شروع', () => {
+  beforeEach(() => {
+    FakeRecognition.instances = []
+    FakeRecognition.nextStartError = null
+  })
+
+  it('service-not-allowed از onerror پیام مجوز میکروفن نمی‌دهد و کد خطا را نشان می‌دهد', () => {
+    const handlers = callbacks()
+    const session = new PersianSpeechSession({ SpeechRecognition: FakeRecognition }, handlers)
+    session.start()
+    const recognition = FakeRecognition.instances[0]
+    expect(recognition.lang).toBe('fa-IR')
+    recognition.emitError('service-not-allowed')
+
+    const message = handlers.onMessage.mock.lastCall?.[0] ?? ''
+    expect(session.status).toBe('error')
+    expect(message).toContain('کد: service-not-allowed')
+    expect(message).toContain('Dictation')
+    expect(message).toContain('این خطا به مجوز میکروفن مربوط نیست')
+    expect(message).not.toContain('اجازهٔ میکروفن')
+    expect(message).not.toContain('Ask یا Allow')
+    expect(session.isActive).toBe(false)
+  })
+
+  it('not-allowed همچنان پیام مجوز میکروفن می‌دهد؛ این دو خطا با هم اشتباه گرفته نمی‌شوند', () => {
+    const handlers = callbacks()
+    const session = new PersianSpeechSession({ SpeechRecognition: FakeRecognition }, handlers)
+    session.start()
+    FakeRecognition.instances[0].emitError('not-allowed')
+    expect(handlers.onMessage.mock.lastCall?.[0]).toContain('اجازهٔ میکروفن')
+    expect(handlers.onMessage.mock.lastCall?.[0]).not.toContain('کد: service-not-allowed')
+    expect(session.status).toBe('error')
+  })
+
+  it('خطای خودِ start (پرتاب‌شده) پیام service-not-allowed را تولید نمی‌کند', () => {
+    FakeRecognition.nextStartError = { name: 'NotAllowedError' }
+    const handlers = callbacks()
+    const session = new PersianSpeechSession({ SpeechRecognition: FakeRecognition }, handlers)
+    session.start()
+    const message = handlers.onMessage.mock.lastCall?.[0] ?? ''
+    expect(message).toContain('مجاز ندانست')
+    expect(message).not.toContain('کد: service-not-allowed')
+  })
+})

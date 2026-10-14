@@ -529,3 +529,41 @@ describe('کلیک دوم روی «توقف» و خروج رابط از حالت
     expect(isListening(container)).toBe(false)
   })
 })
+
+describe('خطای سرویس گفتار و مسیر متنی فارسی', () => {
+  const rice: Product = {
+    id: 'rice-hashemi',
+    name: 'برنج هاشمی',
+    unit: 'کیسه',
+    price: 1_250_000,
+    createdAt: '2026-01-01',
+    updatedAt: '2026-01-01',
+  }
+
+  it('پس از service-not-allowed، دستور تایپی فارسی همچنان اجرا می‌شود و خطای گفتار با پیام دستور قاطی نمی‌شود', () => {
+    setSpeechConstructors(MockRecognition)
+    const { container, props } = renderEditor([rice])
+    const micButton = container.querySelector<HTMLButtonElement>('[aria-label="گفتن دستور با میکروفن"]')!
+    act(() => { micButton.dispatchEvent(new MouseEvent('click', { bubbles: true })) })
+    act(() => { MockRecognition.instances[0].emitError('service-not-allowed') })
+
+    const speechText = container.textContent ?? ''
+    expect(speechText).toContain('کد: service-not-allowed')
+    expect(speechText).not.toContain('اجازهٔ میکروفن')
+    expect(speechText).not.toContain('نمی‌شناسم')
+
+    const input = container.querySelector<HTMLInputElement>('[aria-label="نوشتن دستور فارسی"]')!
+    const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value')?.set
+    act(() => {
+      setter?.call(input, 'دو عدد برنج هاشمی به فاکتور اضافه کن')
+      input.dispatchEvent(new Event('input', { bubbles: true }))
+    })
+    act(() => { container.querySelector<HTMLButtonElement>('.command-run')?.click() })
+
+    expect(props.onChange).toHaveBeenCalledTimes(1)
+    const updated = props.onChange.mock.calls[0][0] as InvoiceForm
+    expect(updated.items).toHaveLength(1)
+    expect(updated.items[0]).toMatchObject({ productId: 'rice-hashemi', quantity: '2', unitPrice: '1250000' })
+    expect(props.onSave).not.toHaveBeenCalled()
+  })
+})
