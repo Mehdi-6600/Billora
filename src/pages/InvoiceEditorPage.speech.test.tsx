@@ -310,3 +310,275 @@ describe('ورود گفتاری در فرم فاکتور', () => {
     expect(recognition.onresult).toBeNull()
   })
 })
+
+describe('دکمهٔ گفتار: توقف، بازیابی و خطای دستور', () => {
+  const rice: Product = {
+    id: 'rice-hashemi',
+    name: 'برنج هاشمی',
+    unit: 'کیسه',
+    price: 1_250_000,
+    createdAt: '2026-01-01',
+    updatedAt: '2026-01-01',
+  }
+  const voiceButton = (container: HTMLElement) => container.querySelector<HTMLButtonElement>('.voice-button')!
+  const press = (element: HTMLElement) => act(() => { element.dispatchEvent(new MouseEvent('click', { bubbles: true })) })
+
+  it('لمس دوم دکمه واقعاً stop را روی همان نشست اجرا می‌کند و اگر end نیامد، دکمه گیر نمی‌کند', () => {
+    setSpeechConstructors(MockRecognition)
+    const { container } = renderEditor([rice])
+    press(voiceButton(container))
+    const recognition = MockRecognition.instances[0]
+    act(() => { recognition.emitStart() })
+    expect(voiceButton(container).textContent).toContain('توقف')
+    expect(voiceButton(container).classList.contains('listening')).toBe(true)
+
+    press(voiceButton(container))
+    expect(recognition.stopCalls).toBe(1)
+    expect(voiceButton(container).textContent).toContain('در حال توقف')
+
+    // Browser never sends end: the second press must end the session on the same instance.
+    press(voiceButton(container))
+    expect(recognition.abortCalls).toBe(1)
+    expect(voiceButton(container).textContent).not.toContain('توقف')
+    expect(voiceButton(container).textContent).not.toContain('در حال توقف')
+    expect(voiceButton(container).classList.contains('listening')).toBe(false)
+    expect(voiceButton(container).getAttribute('aria-label')).toBe('گفتن دستور با میکروفن')
+
+    press(voiceButton(container))
+    expect(MockRecognition.instances).toHaveLength(2)
+    expect(MockRecognition.instances[1].startCalls).toBe(1)
+  })
+
+  it('onstart دیرهنگامِ پس از درخواست توقف، دکمه را دوباره به حالت «توقف» برنمی‌گرداند', () => {
+    setSpeechConstructors(MockRecognition)
+    const { container } = renderEditor([rice])
+    press(voiceButton(container))
+    const recognition = MockRecognition.instances[0]
+    press(voiceButton(container))
+    act(() => { recognition.emitStart() })
+    expect(voiceButton(container).textContent).toContain('در حال توقف')
+    expect(voiceButton(container).textContent).not.toBe('توقف')
+    act(() => { recognition.emitEnd() })
+    expect(voiceButton(container).getAttribute('aria-label')).toBe('گفتن دستور با میکروفن')
+  })
+
+  it('پس از پایان عادی نشست، نتیجهٔ گفتار در فیلد می‌ماند و دکمه بدون اجرای دستور به حالت بازبینی می‌رود', () => {
+    setSpeechConstructors(MockRecognition)
+    const { container, props } = renderEditor([rice])
+    press(voiceButton(container))
+    const recognition = MockRecognition.instances[0]
+    act(() => { recognition.emitStart() })
+    press(voiceButton(container))
+    act(() => {
+      recognition.emitResult('دو عدد برنج هاشمی به فاکتور اضافه کنید')
+      recognition.emitEnd()
+    })
+    expect(container.querySelector<HTMLInputElement>('[aria-label="نوشتن دستور فارسی"]')?.value).toBe('دو عدد برنج هاشمی به فاکتور اضافه کنید')
+    expect(voiceButton(container).getAttribute('aria-label')).toBe('شروع دوبارهٔ تشخیص گفتار')
+    expect(props.onChange).not.toHaveBeenCalled()
+  })
+
+  it('عبارت شناخته‌نشده را با متن شنیده‌شده نشان می‌دهد و فاکتور را تغییر نمی‌دهد', () => {
+    setSpeechConstructors(MockRecognition)
+    const { container, props } = renderEditor([rice])
+    press(voiceButton(container))
+    const recognition = MockRecognition.instances[0]
+    act(() => {
+      recognition.emitStart()
+      recognition.emitResult('این دستور ناشناخته است')
+    })
+    act(() => { container.querySelector<HTMLButtonElement>('.command-run')?.click() })
+    const feedback = container.querySelector<HTMLElement>('[role="status"]')?.textContent ?? ''
+    expect(feedback).toContain('این دستور را نمی‌شناسم')
+    expect(feedback).toContain('این دستور ناشناخته است')
+    expect(feedback).not.toContain('خطای')
+    expect(props.onChange).not.toHaveBeenCalled()
+    expect(container.querySelector<HTMLInputElement>('[aria-label="نوشتن دستور فارسی"]')?.value).toBe('این دستور ناشناخته است')
+  })
+
+  it('خطای مجوز میکروفن پیام خطای گفتار می‌دهد، نه پیام دستور نامعتبر، و فاکتور را تغییر نمی‌دهد', () => {
+    setSpeechConstructors(MockRecognition)
+    const { container, props } = renderEditor([rice])
+    press(voiceButton(container))
+    act(() => { MockRecognition.instances[0].emitError('not-allowed') })
+    const feedback = container.querySelector<HTMLElement>('[role="status"]')?.textContent ?? ''
+    expect(feedback).toContain('اجازهٔ میکروفن')
+    expect(feedback).not.toContain('نمی‌شناسم')
+    expect(voiceButton(container).classList.contains('speech-error')).toBe(true)
+    expect(props.onChange).not.toHaveBeenCalled()
+  })
+})
+
+describe('کلیک دوم روی «توقف» و خروج رابط از حالت شنیدن', () => {
+  const voiceButton = (container: HTMLElement) => container.querySelector<HTMLButtonElement>('.voice-button')!
+  const press = (element: HTMLElement) => act(() => { element.dispatchEvent(new MouseEvent('click', { bubbles: true })) })
+  const feedback = (container: HTMLElement) => container.querySelector<HTMLElement>('[role="status"]')?.textContent ?? ''
+  const isListening = (container: HTMLElement) => voiceButton(container).classList.contains('listening')
+  const isIdle = (container: HTMLElement) => voiceButton(container).getAttribute('aria-label') === 'گفتن دستور با میکروفن'
+
+  class ThrowingStartRecognition extends MockRecognition {
+    override start() { throw { name: 'NotAllowedError' } }
+  }
+
+  it('دقیقاً همان توالی باگ: شنیدن → کلیک دوم «توقف» → onstart دیرهنگام → کلیک سوم لغو می‌کند و رابط آماده می‌شود', () => {
+    setSpeechConstructors(MockRecognition)
+    const { container } = renderEditor()
+    press(voiceButton(container))
+    const recognition = MockRecognition.instances[0]
+    act(() => { recognition.emitStart() })
+    expect(voiceButton(container).textContent).toContain('توقف')
+    expect(isListening(container)).toBe(true)
+
+    press(voiceButton(container))
+    expect(recognition.stopCalls).toBe(1)
+    expect(voiceButton(container).textContent).toContain('در حال توقف')
+    expect(isListening(container)).toBe(false)
+
+    // The browser reports `start` after the stop request: the UI must not go back to red «توقف».
+    act(() => { recognition.emitStart() })
+    expect(isListening(container)).toBe(false)
+    expect(voiceButton(container).textContent).not.toBe('توقف')
+    expect(feedback(container)).toContain('هنوز ممکن است فعال باشد')
+
+    // The browser never sends `end`: the next press must end the session on the same instance.
+    press(voiceButton(container))
+    expect(recognition.abortCalls).toBe(1)
+    expect(isListening(container)).toBe(false)
+    expect(voiceButton(container).textContent).not.toContain('در حال توقف')
+    expect(isIdle(container)).toBe(true)
+  })
+
+  it('onend دیرهنگام از نشست لغوشده، نشست تازهٔ بعدی را تغییر نمی‌دهد', () => {
+    setSpeechConstructors(MockRecognition)
+    const { container } = renderEditor()
+    press(voiceButton(container))
+    const first = MockRecognition.instances[0]
+    act(() => { first.emitStart() })
+    press(voiceButton(container))
+    press(voiceButton(container))
+    expect(first.abortCalls).toBe(1)
+
+    press(voiceButton(container))
+    const second = MockRecognition.instances[1]
+    expect(second.startCalls).toBe(1)
+    expect(voiceButton(container).textContent).toContain('آماده‌سازی')
+
+    act(() => { first.emitEnd() })
+    act(() => { first.emitResult('دو عدد برنج هاشمی به فاکتور اضافه کن') })
+    expect(voiceButton(container).textContent).toContain('آماده‌سازی')
+    expect(container.querySelector<HTMLInputElement>('[aria-label="نوشتن دستور فارسی"]')?.value).toBe('')
+
+    act(() => { second.emitStart() })
+    expect(isListening(container)).toBe(true)
+  })
+
+  it('نتیجهٔ دیرهنگام پس از توقف در فیلد می‌نشیند و onend بعدی وضعیت بازبینی را پاک نمی‌کند', () => {
+    setSpeechConstructors(MockRecognition)
+    const { container, props } = renderEditor()
+    press(voiceButton(container))
+    const recognition = MockRecognition.instances[0]
+    act(() => { recognition.emitStart() })
+    press(voiceButton(container))
+    act(() => { recognition.emitResult('دو کیسه برنج هاشمی به فاکتور اضافه کن') })
+    act(() => { recognition.emitEnd() })
+    expect(container.querySelector<HTMLInputElement>('[aria-label="نوشتن دستور فارسی"]')?.value).toBe('دو کیسه برنج هاشمی به فاکتور اضافه کن')
+    expect(voiceButton(container).getAttribute('aria-label')).toBe('شروع دوبارهٔ تشخیص گفتار')
+    expect(isListening(container)).toBe(false)
+    expect(props.onChange).not.toHaveBeenCalled()
+  })
+
+  it('خطای شبکه هنگام توقف، دکمه را از حالت شنیدن خارج و خطا را گزارش می‌کند، نه پیام دستور', () => {
+    setSpeechConstructors(MockRecognition)
+    const { container, props } = renderEditor()
+    press(voiceButton(container))
+    const recognition = MockRecognition.instances[0]
+    act(() => { recognition.emitStart() })
+    press(voiceButton(container))
+    act(() => { recognition.emitError('network') })
+    expect(isListening(container)).toBe(false)
+    expect(voiceButton(container).classList.contains('speech-error')).toBe(true)
+    expect(feedback(container)).toContain('سرویس تشخیص گفتار به شبکه وصل نشد')
+    expect(feedback(container)).not.toContain('نمی‌شناسم')
+    act(() => { recognition.emitEnd() })
+    expect(voiceButton(container).classList.contains('speech-error')).toBe(true)
+    expect(props.onChange).not.toHaveBeenCalled()
+  })
+
+  it('شروع ناموفق با NotAllowedError دکمه را در حالت شنیدن نگه نمی‌دارد', () => {
+    setSpeechConstructors(ThrowingStartRecognition)
+    const { container } = renderEditor()
+    press(voiceButton(container))
+    expect(isListening(container)).toBe(false)
+    expect(voiceButton(container).classList.contains('speech-error')).toBe(true)
+    expect(voiceButton(container).getAttribute('aria-label')).toBe('تلاش دوباره برای تشخیص گفتار')
+    expect(feedback(container)).toContain('مجاز ندانست')
+    expect(feedback(container)).not.toContain('نمی‌شناسم')
+  })
+
+  it('اگر onstart هرگز نیاید، کلیک دوم و سوم هر دو نشست را می‌بندند و رابط گیر نمی‌کند', () => {
+    setSpeechConstructors(MockRecognition)
+    const { container } = renderEditor()
+    press(voiceButton(container))
+    const recognition = MockRecognition.instances[0]
+    expect(voiceButton(container).textContent).toContain('آماده‌سازی')
+    press(voiceButton(container))
+    expect(recognition.stopCalls).toBe(1)
+    press(voiceButton(container))
+    expect(recognition.abortCalls).toBe(1)
+    expect(isIdle(container)).toBe(true)
+    expect(isListening(container)).toBe(false)
+  })
+})
+
+describe('خطای سرویس گفتار و مسیر متنی فارسی', () => {
+  const rice: Product = {
+    id: 'rice-hashemi',
+    name: 'برنج هاشمی',
+    unit: 'کیسه',
+    price: 1_250_000,
+    createdAt: '2026-01-01',
+    updatedAt: '2026-01-01',
+  }
+
+  it('پس از service-not-allowed، دستور تایپی فارسی همچنان اجرا می‌شود و خطای گفتار با پیام دستور قاطی نمی‌شود', () => {
+    setSpeechConstructors(MockRecognition)
+    const { container, props } = renderEditor([rice])
+    const micButton = container.querySelector<HTMLButtonElement>('[aria-label="گفتن دستور با میکروفن"]')!
+    act(() => { micButton.dispatchEvent(new MouseEvent('click', { bubbles: true })) })
+    act(() => { MockRecognition.instances[0].emitError('service-not-allowed') })
+
+    const speechText = container.textContent ?? ''
+    expect(speechText).toContain('کد: service-not-allowed')
+    expect(speechText).not.toContain('اجازهٔ میکروفن')
+    expect(speechText).not.toContain('نمی‌شناسم')
+
+    const input = container.querySelector<HTMLInputElement>('[aria-label="نوشتن دستور فارسی"]')!
+    const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value')?.set
+    act(() => {
+      setter?.call(input, 'دو عدد برنج هاشمی به فاکتور اضافه کن')
+      input.dispatchEvent(new Event('input', { bubbles: true }))
+    })
+    act(() => { container.querySelector<HTMLButtonElement>('.command-run')?.click() })
+
+    expect(props.onChange).toHaveBeenCalledTimes(1)
+    const updated = props.onChange.mock.calls[0][0] as InvoiceForm
+    expect(updated.items).toHaveLength(1)
+    expect(updated.items[0]).toMatchObject({ productId: 'rice-hashemi', quantity: '2', unitPrice: '1250000' })
+    expect(props.onSave).not.toHaveBeenCalled()
+  })
+})
+
+describe('تلاش دوباره پس از رد سرویس گفتار در همان صفحه', () => {
+  it('دکمهٔ میکروفن پس از service-not-allowed نشست جدید نمی‌سازد و پیام تایپ دستور را نشان می‌دهد', () => {
+    setSpeechConstructors(MockRecognition)
+    const { container } = renderEditor()
+    const micButton = () => container.querySelector<HTMLButtonElement>('.voice-button')!
+    act(() => { micButton().dispatchEvent(new MouseEvent('click', { bubbles: true })) })
+    act(() => { MockRecognition.instances[0].emitError('service-not-allowed') })
+    act(() => { micButton().dispatchEvent(new MouseEvent('click', { bubbles: true })) })
+
+    expect(MockRecognition.instances).toHaveLength(1)
+    expect(container.textContent).toContain('دستور را تایپ کنید')
+    expect(container.textContent).toContain('صفحه را دوباره باز کنید')
+  })
+})

@@ -136,7 +136,6 @@ describe('سازگاری و چرخهٔ Web Speech API', () => {
     expect(recognition.startCalls).toBe(1)
 
     expect(session.stop()).toBe(true)
-    expect(session.stop()).toBe(false)
     expect(recognition.stopCalls).toBe(1)
     recognition.emitEnd()
     expect(session.status).toBe('idle')
@@ -187,5 +186,186 @@ describe('سازگاری و چرخهٔ Web Speech API', () => {
     expect(recognition.onerror).toBeNull()
     expect(recognition.onend).toBeNull()
     expect(session.start()).toBe(false)
+  })
+})
+
+describe('چرخهٔ توقف، پایان و بازیابی نشست', () => {
+  beforeEach(() => {
+    FakeRecognition.instances = []
+    FakeRecognition.nextStartError = null
+  })
+
+  it('اگر مرورگر پس از stop پایان نفرستد، لمس دوم نشست را با abort روی همان نمونه می‌بندد', () => {
+    const handlers = callbacks()
+    const session = new PersianSpeechSession({ SpeechRecognition: FakeRecognition }, handlers)
+    session.start()
+    const recognition = FakeRecognition.instances[0]
+    recognition.emitStart()
+
+    expect(session.stop()).toBe(true)
+    expect(session.status).toBe('stopping')
+    expect(recognition.stopCalls).toBe(1)
+
+    // No onend arrives here: the second press must not leave the UI in «در حال توقف» for ever.
+    expect(session.stop()).toBe(true)
+    expect(recognition.abortCalls).toBe(1)
+    expect(session.status).toBe('idle')
+    expect(session.isActive).toBe(false)
+    expect(recognition.onend).toBeNull()
+
+    expect(session.start()).toBe(true)
+    expect(FakeRecognition.instances).toHaveLength(2)
+  })
+
+  it('onstart دیرهنگام پس از درخواست توقف، وضعیت را دوباره به «در حال شنیدن» برنمی‌گرداند', () => {
+    const session = new PersianSpeechSession({ SpeechRecognition: FakeRecognition }, callbacks())
+    session.start()
+    const recognition = FakeRecognition.instances[0]
+    session.stop()
+    recognition.emitStart()
+    expect(session.status).toBe('stopping')
+    recognition.emitEnd()
+    expect(session.status).toBe('idle')
+    expect(session.isActive).toBe(false)
+  })
+
+  it('نتیجهٔ رسیده در حین توقف حفظ می‌شود و onend بعدی آن را پاک نمی‌کند', () => {
+    const handlers = callbacks()
+    const session = new PersianSpeechSession({ SpeechRecognition: FakeRecognition }, handlers)
+    session.start()
+    const recognition = FakeRecognition.instances[0]
+    recognition.emitStart()
+    session.stop()
+    recognition.emitResult('دو عدد برنج هاشمی به فاکتور اضافه کن')
+    recognition.emitEnd()
+    expect(handlers.onTranscript).toHaveBeenCalledExactlyOnceWith('دو عدد برنج هاشمی به فاکتور اضافه کن')
+    expect(session.status).toBe('result')
+    expect(session.isActive).toBe(false)
+  })
+
+  it('اگر end هرگز نیامد و نتیجه هم داده شد، شروع بعدی نشست معلق را کنار می‌گذارد و نتیجهٔ قدیمی را دوباره نمی‌دهد', () => {
+    const handlers = callbacks()
+    const session = new PersianSpeechSession({ SpeechRecognition: FakeRecognition }, handlers)
+    session.start()
+    const first = FakeRecognition.instances[0]
+    first.emitStart()
+    first.emitResult('سه عدد شیر به فاکتور اضافه کن')
+
+    expect(session.start()).toBe(true)
+    expect(FakeRecognition.instances).toHaveLength(2)
+    expect(first.abortCalls).toBe(1)
+    expect(first.onresult).toBeNull()
+    first.emitResult('سه عدد شیر به فاکتور اضافه کن')
+    expect(handlers.onTranscript).toHaveBeenCalledTimes(1)
+  })
+
+  it('stop بعد از پایان نشست یا بدون نشست، هیچ دستور توقفی به مرورگر نمی‌فرستد', () => {
+    const session = new PersianSpeechSession({ SpeechRecognition: FakeRecognition }, callbacks())
+    expect(session.stop()).toBe(false)
+    session.start()
+    const recognition = FakeRecognition.instances[0]
+    recognition.emitEnd()
+    expect(session.stop()).toBe(false)
+    expect(recognition.stopCalls).toBe(0)
+    expect(recognition.abortCalls).toBe(0)
+  })
+
+  it('خطای stop از مرورگر نشست را پاک می‌کند و وضعیت خطا می‌دهد', () => {
+    class ThrowingStop extends FakeRecognition {
+      override stop() { throw { name: 'InvalidStateError' } }
+    }
+    const handlers = callbacks()
+    const session = new PersianSpeechSession({ SpeechRecognition: ThrowingStop }, handlers)
+    session.start()
+    session.stop()
+    expect(session.status).toBe('error')
+    expect(session.isActive).toBe(false)
+    expect(handlers.onMessage.mock.lastCall?.[0]).toContain('نشست قبلی')
+  })
+
+  it('خطای مجوز میکروفن در میانهٔ نشست، نشست را می‌بندد و اجرای مجدد را ممکن می‌کند', () => {
+    const handlers = callbacks()
+    const session = new PersianSpeechSession({ SpeechRecognition: FakeRecognition }, handlers)
+    session.start()
+    FakeRecognition.instances[0].emitError('not-allowed')
+    expect(session.status).toBe('error')
+    expect(handlers.onMessage.mock.lastCall?.[0]).toContain('اجازهٔ میکروفن')
+    expect(session.start()).toBe(true)
+  })
+})
+
+describe('تشخیص خطای سرویس گفتار از خطای مجوز و خطای شروع', () => {
+  beforeEach(() => {
+    FakeRecognition.instances = []
+    FakeRecognition.nextStartError = null
+  })
+
+  it('service-not-allowed از onerror پیام مجوز میکروفن نمی‌دهد و کد خطا را نشان می‌دهد', () => {
+    const handlers = callbacks()
+    const session = new PersianSpeechSession({ SpeechRecognition: FakeRecognition }, handlers)
+    session.start()
+    const recognition = FakeRecognition.instances[0]
+    expect(recognition.lang).toBe('fa-IR')
+    recognition.emitError('service-not-allowed')
+
+    const message = handlers.onMessage.mock.lastCall?.[0] ?? ''
+    expect(session.status).toBe('error')
+    expect(message).toContain('کد: service-not-allowed')
+    expect(message).toContain('Dictation')
+    expect(message).toContain('این خطا به مجوز میکروفن مربوط نیست')
+    expect(message).not.toContain('اجازهٔ میکروفن')
+    expect(message).not.toContain('Ask یا Allow')
+    expect(session.isActive).toBe(false)
+  })
+
+  it('not-allowed همچنان پیام مجوز میکروفن می‌دهد؛ این دو خطا با هم اشتباه گرفته نمی‌شوند', () => {
+    const handlers = callbacks()
+    const session = new PersianSpeechSession({ SpeechRecognition: FakeRecognition }, handlers)
+    session.start()
+    FakeRecognition.instances[0].emitError('not-allowed')
+    expect(handlers.onMessage.mock.lastCall?.[0]).toContain('اجازهٔ میکروفن')
+    expect(handlers.onMessage.mock.lastCall?.[0]).not.toContain('کد: service-not-allowed')
+    expect(session.status).toBe('error')
+  })
+
+  it('خطای خودِ start (پرتاب‌شده) پیام service-not-allowed را تولید نمی‌کند', () => {
+    FakeRecognition.nextStartError = { name: 'NotAllowedError' }
+    const handlers = callbacks()
+    const session = new PersianSpeechSession({ SpeechRecognition: FakeRecognition }, handlers)
+    session.start()
+    const message = handlers.onMessage.mock.lastCall?.[0] ?? ''
+    expect(message).toContain('مجاز ندانست')
+    expect(message).not.toContain('کد: service-not-allowed')
+  })
+})
+
+describe('تلاش دوباره پس از service-not-allowed پیش از شروع', () => {
+  beforeEach(() => {
+    FakeRecognition.instances = []
+    FakeRecognition.nextStartError = null
+  })
+
+  it('اگر سرویس پیش از onstart رد شود، تلاش بعدی نشست جدید نمی‌سازد و پیام صریح می‌دهد', () => {
+    const handlers = callbacks()
+    const session = new PersianSpeechSession({ SpeechRecognition: FakeRecognition }, handlers)
+    expect(session.start()).toBe(true)
+    FakeRecognition.instances[0].emitError('service-not-allowed')
+
+    expect(session.start()).toBe(false)
+    expect(FakeRecognition.instances).toHaveLength(1)
+    const message = handlers.onMessage.mock.lastCall?.[0] ?? ''
+    expect(message).toContain('دستور را تایپ کنید')
+    expect(message).toContain('صفحه را دوباره باز کنید')
+    expect(session.status).toBe('error')
+  })
+
+  it('اگر سرویس در میانهٔ یک نشست فعال قطع شود، تلاش بعدی مجاز می‌ماند', () => {
+    const session = new PersianSpeechSession({ SpeechRecognition: FakeRecognition }, callbacks())
+    session.start()
+    FakeRecognition.instances[0].emitStart()
+    FakeRecognition.instances[0].emitError('service-not-allowed')
+
+    expect(session.start()).toBe(true)
+    expect(FakeRecognition.instances).toHaveLength(2)
   })
 })

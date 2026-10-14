@@ -56,9 +56,14 @@ export function speechErrorMessage(code: string): { status: 'idle' | 'error'; me
         message: 'اجازهٔ میکروفن یا تشخیص گفتار رد شد. در تنظیمات Safari برای این وب‌سایت دسترسی Microphone را روی Ask یا Allow بگذارید و دوباره تلاش کنید.',
       }
     case 'service-not-allowed':
+      // WebKit reports this before any per-site prompt when the speech service is not available for the requested
+      // language (for example fa-IR), or when the speech service itself is disabled. It is not a microphone permission.
       return {
         status: 'error',
-        message: 'Safari اجازهٔ استفاده از سرویس تشخیص گفتار را نداد. تنظیمات دسترسی سایت و محدودیت‌های Screen Time را بررسی کنید.',
+        message: 'سرویس تشخیص گفتار Safari برای فارسی یا در این دستگاه در دسترس نیست (کد: service-not-allowed). '
+          + 'این خطا به مجوز میکروفن مربوط نیست. دلیل‌های ممکن: Safari برای فارسی سرویس گفتار ندارد، '
+          + 'یا Siri و Dictation غیرفعال یا محدود شده‌اند، یا دسترسی Speech Recognition برای Safari بسته است. '
+          + 'دستور را تایپ کنید؛ پردازش دستورهای فارسی بدون گفتار کار می‌کند.',
       }
     case 'audio-capture':
       return {
@@ -118,11 +123,17 @@ function speechStartErrorMessage(error: unknown): string {
 
 const openStatuses = new Set<SpeechStatus>(['starting', 'listening', 'stopping'])
 
+const SERVICE_UNAVAILABLE_MESSAGE = 'گفتار فارسی در این صفحه در دسترس نیست؛ دستور را تایپ کنید. '
+  + 'اگر تنظیمات را تغییر دادید، صفحه را دوباره باز کنید.'
+
 /** A small, testable owner for one browser SpeechRecognition session. */
 export class PersianSpeechSession {
   private recognition: SpeechRecognitionLike | null = null
   private disposed = false
   private currentStatus: SpeechStatus = 'idle'
+  // Set when Safari refuses the speech service before the first `start` event (for example fa-IR is not available).
+  // Retrying in the same page load would ask for the same unavailable service again, so the session stops retrying.
+  private serviceUnavailable = false
 
   constructor(
     private readonly host: SpeechWindowLike,
@@ -139,11 +150,20 @@ export class PersianSpeechSession {
 
   start(): boolean {
     if (this.disposed) return false
-    if (this.recognition) {
-      this.publishMessage(this.currentStatus === 'stopping'
-        ? 'در حال توقف نشست قبلی هستیم؛ پس از پایان دوباره تلاش کنید.'
-        : 'تشخیص گفتار از قبل در حال اجراست. ابتدا همان نشست را متوقف کنید.')
+    if (this.serviceUnavailable) {
+      this.publishMessage(SERVICE_UNAVAILABLE_MESSAGE)
       return false
+    }
+    if (this.recognition) {
+      if (openStatuses.has(this.currentStatus)) {
+        this.publishMessage(this.currentStatus === 'stopping'
+          ? 'در حال توقف نشست قبلی هستیم؛ برای لغو، دوباره دکمه را بزنید.'
+          : 'تشخیص گفتار از قبل در حال اجراست. ابتدا همان نشست را متوقف کنید.')
+        return false
+      }
+      // The previous instance already produced its result (or failed) but the browser has not reported `end` yet.
+      // Retire that instance through the API so the user is never locked out, then start a fresh one.
+      this.retire(this.recognition)
     }
 
     const Recognition = getSpeechRecognitionConstructor(this.host)
@@ -174,6 +194,13 @@ export class PersianSpeechSession {
 
       recognition.onstart = () => {
         if (!this.isCurrent(recognition)) return
+        // A late `start` after a stop request must not revive the listening UI, but the browser may still hold the microphone.
+        if (this.currentStatus !== 'starting') {
+          if (this.currentStatus === 'stopping') {
+            this.publishMessage('میکروفن هنوز ممکن است فعال باشد؛ اگر پایان نیامد، دوباره دکمه را بزنید تا لغو شود.')
+          }
+          return
+        }
         this.publishStatus('listening')
         this.publishMessage('در حال شنیدن… پس از نمایش متن، آن را بررسی کنید.')
       }
@@ -191,6 +218,7 @@ export class PersianSpeechSession {
       }
       recognition.onerror = (event) => {
         if (!this.isCurrent(recognition)) return
+        if (event.error === 'service-not-allowed' && this.currentStatus === 'starting') this.serviceUnavailable = true
         const result = speechErrorMessage(event.error ?? '')
         this.release(recognition, true)
         this.publishStatus(result.status)
@@ -223,10 +251,21 @@ export class PersianSpeechSession {
     }
   }
 
+  /**
+   * First press asks the browser to stop and keep its result.
+   * A second press while the browser has not reported `end` escalates to `abort()` on the same instance:
+   * the session is discarded, handlers are detached, and the UI returns to idle without waiting for an event that may never come.
+   */
   stop(): boolean {
     const recognition = this.recognition
     if (!recognition || this.disposed) return false
-    if (this.currentStatus === 'stopping') return false
+
+    if (this.currentStatus === 'stopping') {
+      this.retire(recognition)
+      this.publishStatus('idle')
+      this.publishMessage('ضبط لغو شد؛ متنی ثبت نشد.')
+      return true
+    }
 
     this.publishStatus('stopping')
     this.publishMessage('در حال توقف تشخیص گفتار…')
@@ -234,9 +273,7 @@ export class PersianSpeechSession {
       recognition.stop()
       return true
     } catch (error) {
-      if (this.recognition === recognition) this.recognition = null
-      this.clearHandlers(recognition)
-      try { recognition.abort?.() } catch { /* stop() may have run after the user agent already ended. */ }
+      this.retire(recognition)
       this.publishStatus('error')
       this.publishMessage(speechStartErrorMessage(error))
       return false
@@ -267,6 +304,18 @@ export class PersianSpeechSession {
     this.recognition = null
     this.clearHandlers(recognition)
     if (!cancelNative) return
+    try {
+      if (recognition.abort) recognition.abort()
+      else recognition.stop()
+    } catch {
+      // The user agent may already have ended the native session.
+    }
+  }
+
+  /** Detach handlers first so late browser events cannot touch the UI, then abort the native instance. */
+  private retire(recognition: SpeechRecognitionLike): void {
+    if (this.recognition === recognition) this.recognition = null
+    this.clearHandlers(recognition)
     try {
       if (recognition.abort) recognition.abort()
       else recognition.stop()

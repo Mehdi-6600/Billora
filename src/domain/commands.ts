@@ -22,6 +22,9 @@ const numberWords: Record<string, number> = {
   ده: 10,
 }
 
+const unitWords = new Set(['عدد', 'دانه', 'بسته', 'کیسه', 'کیلو', 'کیلوگرم', 'لیتر', 'بطری', 'قوطی', 'پاکت'])
+const unitPrefix = /^(?:عدد|دانه|بسته|کیسه|کیلو|کیلوگرم|لیتر|بطری|قوطی|پاکت)\s+/
+
 function normalizeCommand(value: string): string {
   return normalizeDigits(value)
     .toLocaleLowerCase('fa-IR')
@@ -72,10 +75,14 @@ export function parseCommand(input: string): ParsedCommand | null {
     }
   }
 
-  const addMatch = text.match(/^([^\s]+)\s+(.+?)\s+به\s+فاکتور\s+اضافه\s+کن$/)
+  // Speech engines vary between «به فاکتور»، «توی فاکتور»، «به فاکتورم» and «اضافه کن/کنید».
+  const addMatch = text.match(/^([^\s]+)\s+(.+?)\s+(?:به|توی|تو|در)\s+فاکتور(?:م)?\s+اضافه\s+کن(?:ید)?$/)
   if (addMatch) {
     const quantity = parseCommandNumber(addMatch[1])
-    const productName = cleanProductName(addMatch[2].replace(/^(?:عدد|دانه|بسته|کیسه|کیلو|کیلوگرم|لیتر)\s+/, ''))
+    // «را» is a grammatical object marker that speech engines often add before «به فاکتور».
+    const rawName = addMatch[2].replace(/\s+را$/, '')
+    // A bare unit such as «عدد» is not a product name («دو عدد به فاکتور اضافه کن» must not add «عدد»).
+    const productName = unitWords.has(rawName) ? '' : cleanProductName(rawName.replace(unitPrefix, ''))
     if (quantity !== null && quantity > 0 && productName) {
       return { type: 'addInvoiceItem', productName, quantity }
     }
