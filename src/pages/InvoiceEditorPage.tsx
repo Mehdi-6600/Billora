@@ -146,6 +146,10 @@ export function InvoiceEditorPage({
     setPending(null)
     setTargetPrompt(null)
     setCommandMessage('')
+    if (!commandText.trim()) {
+      setCommandMessage('متنی برای پردازش دریافت نشد. گفتار را دوباره ضبط کنید یا دستور را با صفحه‌کلید وارد کنید.')
+      return
+    }
     const command = parseCommand(commandText)
     if (!command) {
       setCommandMessage('این دستور را نمی‌شناسم. از یکی از نمونه‌های پایین استفاده کنید یا نام و عدد را واضح‌تر بنویسید.')
