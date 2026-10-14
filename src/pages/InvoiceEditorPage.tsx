@@ -18,6 +18,7 @@ import {
 import { calculateInvoiceTotals, calculateLineAmounts, formatNumber, formatToman, parseLocalizedNumber } from '../domain/calculations'
 import { normalizeProductName, parseCommand, supportedCommandExamples, type ParsedCommand } from '../domain/commands'
 import { planCommand, productConfirmation, type ProductCommandAction } from '../domain/command-execution'
+import { PersianSpeechSession, type SpeechStatus } from '../domain/speech-recognition'
 import type { InvoiceForm, InvoiceLineForm } from '../domain/invoice-form'
 import type { Product, ProductDraft } from '../domain/types'
 import { createId } from '../utils'
@@ -80,13 +81,22 @@ export function InvoiceEditorPage({
   const [pending, setPending] = useState<PendingAction | null>(null)
   const [targetPrompt, setTargetPrompt] = useState<TargetPrompt | null>(null)
   const [targetId, setTargetId] = useState('')
-  const [listening, setListening] = useState(false)
+  const [speechStatus, setSpeechStatus] = useState<SpeechStatus>('idle')
   const [busy, setBusy] = useState(false)
   const [formError, setFormError] = useState('')
-  const recognitionRef = useRef<SpeechRecognition | null>(null)
+  const recognitionRef = useRef<PersianSpeechSession | null>(null)
 
-  useEffect(() => () => {
-    try { recognitionRef.current?.stop() } catch { /* The browser may already have stopped listening. */ }
+  useEffect(() => {
+    const session = new PersianSpeechSession(window, {
+      onStatusChange: setSpeechStatus,
+      onMessage: setCommandMessage,
+      onTranscript: (transcript) => setCommandText(transcript),
+    })
+    recognitionRef.current = session
+    return () => {
+      if (recognitionRef.current === session) recognitionRef.current = null
+      session.dispose()
+    }
   }, [])
 
   const parsedItems = useMemo(() => form.items.map((item) => ({ item, amount: amountForLine(item) })), [form.items])
@@ -220,45 +230,33 @@ export function InvoiceEditorPage({
     }
   }
 
-  const startListening = () => {
-    const Recognition = window.SpeechRecognition ?? window.webkitSpeechRecognition
-    if (!Recognition) {
-      setCommandMessage('این مرورگر Web Speech API را پشتیبانی نمی‌کند. می‌توانید دستور را با صفحه‌کلید فارسی بنویسید.')
-      return
-    }
-    try {
-      recognitionRef.current?.stop()
-      const recognition = new Recognition()
-      recognition.lang = 'fa-IR'
-      recognition.continuous = false
-      recognition.interimResults = false
-      recognition.onresult = (event) => {
-        const transcript = event.results?.[0]?.[0]?.transcript ?? ''
-        setCommandText(transcript)
-        setCommandMessage(transcript ? 'متن شنیده‌شده را بازبینی کنید؛ تا وقتی «اجرای دستور» را نزنید تغییری انجام نمی‌شود.' : 'گفتار قابل‌فهمی دریافت نشد؛ دوباره تلاش کنید.')
-      }
-      recognition.onerror = (event) => {
-        const message = event.error === 'not-allowed' || event.error === 'service-not-allowed'
-          ? 'دسترسی میکروفن داده نشد. مجوز میکروفن مرورگر را بررسی کنید.'
-          : event.error === 'network'
-            ? 'تشخیص گفتار مرورگر به شبکه نیاز پیدا کرد و شکست خورد؛ این قابلیت آفلاین تضمین نمی‌شود.'
-            : event.error === 'no-speech'
-              ? 'صدایی دریافت نشد؛ میکروفن را بررسی و دوباره تلاش کنید.'
-              : 'تشخیص گفتار در دسترس نبود. متن دستور را تایپ کنید.'
-        setCommandMessage(message)
-      }
-      recognition.onend = () => setListening(false)
-      recognitionRef.current = recognition
-      setListening(true)
-      setCommandMessage('در حال گوش‌دادن… پس از نمایش متن، آن را بررسی کنید.')
-      recognition.start()
-    } catch {
-      setListening(false)
-      setCommandMessage('شروع میکروفن ناموفق بود. در صورت نیاز مجوز میکروفن را در مرورگر فعال کنید.')
-    }
-  }
+  const startListening = () => recognitionRef.current?.start()
 
   const invoiceNumber = form.number ?? 'پس از ذخیره شماره می‌گیرد'
+  const speechBusy = speechStatus === 'starting' || speechStatus === 'listening' || speechStatus === 'stopping'
+  const speechError = speechStatus === 'error' || speechStatus === 'unsupported'
+  const voiceButtonLabel = speechBusy
+    ? 'توقف تشخیص گفتار'
+    : speechStatus === 'unsupported'
+      ? 'تشخیص گفتار پشتیبانی نمی‌شود؛ متن را دستی وارد کنید'
+      : speechStatus === 'result'
+        ? 'شروع دوبارهٔ تشخیص گفتار'
+        : speechStatus === 'error'
+          ? 'تلاش دوباره برای تشخیص گفتار'
+          : 'گفتن دستور با میکروفن'
+  const voiceButtonText = speechStatus === 'starting'
+    ? 'آماده‌سازی…'
+    : speechStatus === 'listening'
+      ? 'توقف'
+      : speechStatus === 'stopping'
+        ? 'در حال توقف…'
+        : speechStatus === 'result'
+          ? 'دوباره'
+          : speechStatus === 'unsupported'
+            ? 'بدون پشتیبانی'
+            : speechStatus === 'error'
+              ? 'تلاش دوباره'
+              : 'گفتار'
 
   return (
     <div className="page-stack invoice-editor-page">
@@ -341,7 +339,7 @@ export function InvoiceEditorPage({
         <div className="command-heading"><span className="command-heading-icon"><Sparkles size={18} /></span><div><span className="panel-kicker">پردازش محلی · بدون API هوش مصنوعی</span><h2>دستور متنی فارسی</h2><p>برای فاکتور یا فهرست محصولات، یکی از دستورهای مشخص را بنویسید.</p></div></div>
         <div className="command-input-row">
           <input value={commandText} onChange={(event) => { setCommandText(event.target.value); setCommandMessage('') }} onKeyDown={(event) => { if (event.key === 'Enter' && !event.shiftKey) { event.preventDefault(); runCommand() } }} placeholder="مثلاً: سه عدد شیر به فاکتور اضافه کن" aria-label="نوشتن دستور فارسی" />
-          <button type="button" className={`voice-button${listening ? ' listening' : ''}`} onClick={listening ? () => recognitionRef.current?.stop() : startListening} aria-label={listening ? 'توقف ضبط' : 'گفتن دستور با میکروفن'} title="تشخیص گفتار مرورگر؛ آفلاین تضمین نمی‌شود">{listening ? <MicOff size={17} /> : <Mic size={17} />}<span>{listening ? 'توقف' : 'گفتار'}</span></button>
+          <button type="button" className={`voice-button${speechStatus === 'listening' ? ' listening' : ''}${speechError ? ' speech-error' : ''}${speechStatus === 'result' ? ' speech-complete' : ''}`} onClick={speechBusy ? () => recognitionRef.current?.stop() : startListening} aria-label={voiceButtonLabel} title="تشخیص گفتار مرورگر؛ آفلاین تضمین نمی‌شود">{speechBusy ? <MicOff size={17} /> : speechStatus === 'result' ? <Check size={17} /> : <Mic size={17} />}<span>{voiceButtonText}</span></button>
           <button type="button" className="button button-primary command-run" onClick={runCommand}>اجرای دستور</button>
         </div>
         <p className="voice-disclaimer">تشخیص گفتار فقط به Web Speech API مرورگر وابسته است؛ پشتیبانی فارسی و کارکرد آفلاین تضمین نمی‌شود و ممکن است به اینترنت یا مجوز میکروفن نیاز داشته باشد. بعضی مرورگرها صدا را برای پردازش به سرویس گفتار خود می‌فرستند. متن شنیده‌شده خودکار اجرا نمی‌شود.</p>
