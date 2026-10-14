@@ -567,3 +567,18 @@ describe('خطای سرویس گفتار و مسیر متنی فارسی', () =>
     expect(props.onSave).not.toHaveBeenCalled()
   })
 })
+
+describe('تلاش دوباره پس از رد سرویس گفتار در همان صفحه', () => {
+  it('دکمهٔ میکروفن پس از service-not-allowed نشست جدید نمی‌سازد و پیام تایپ دستور را نشان می‌دهد', () => {
+    setSpeechConstructors(MockRecognition)
+    const { container } = renderEditor()
+    const micButton = () => container.querySelector<HTMLButtonElement>('.voice-button')!
+    act(() => { micButton().dispatchEvent(new MouseEvent('click', { bubbles: true })) })
+    act(() => { MockRecognition.instances[0].emitError('service-not-allowed') })
+    act(() => { micButton().dispatchEvent(new MouseEvent('click', { bubbles: true })) })
+
+    expect(MockRecognition.instances).toHaveLength(1)
+    expect(container.textContent).toContain('دستور را تایپ کنید')
+    expect(container.textContent).toContain('صفحه را دوباره باز کنید')
+  })
+})

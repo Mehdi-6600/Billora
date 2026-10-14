@@ -338,3 +338,34 @@ describe('تشخیص خطای سرویس گفتار از خطای مجوز و خ
     expect(message).not.toContain('کد: service-not-allowed')
   })
 })
+
+describe('تلاش دوباره پس از service-not-allowed پیش از شروع', () => {
+  beforeEach(() => {
+    FakeRecognition.instances = []
+    FakeRecognition.nextStartError = null
+  })
+
+  it('اگر سرویس پیش از onstart رد شود، تلاش بعدی نشست جدید نمی‌سازد و پیام صریح می‌دهد', () => {
+    const handlers = callbacks()
+    const session = new PersianSpeechSession({ SpeechRecognition: FakeRecognition }, handlers)
+    expect(session.start()).toBe(true)
+    FakeRecognition.instances[0].emitError('service-not-allowed')
+
+    expect(session.start()).toBe(false)
+    expect(FakeRecognition.instances).toHaveLength(1)
+    const message = handlers.onMessage.mock.lastCall?.[0] ?? ''
+    expect(message).toContain('دستور را تایپ کنید')
+    expect(message).toContain('صفحه را دوباره باز کنید')
+    expect(session.status).toBe('error')
+  })
+
+  it('اگر سرویس در میانهٔ یک نشست فعال قطع شود، تلاش بعدی مجاز می‌ماند', () => {
+    const session = new PersianSpeechSession({ SpeechRecognition: FakeRecognition }, callbacks())
+    session.start()
+    FakeRecognition.instances[0].emitStart()
+    FakeRecognition.instances[0].emitError('service-not-allowed')
+
+    expect(session.start()).toBe(true)
+    expect(FakeRecognition.instances).toHaveLength(2)
+  })
+})

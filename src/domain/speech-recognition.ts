@@ -123,11 +123,17 @@ function speechStartErrorMessage(error: unknown): string {
 
 const openStatuses = new Set<SpeechStatus>(['starting', 'listening', 'stopping'])
 
+const SERVICE_UNAVAILABLE_MESSAGE = 'گفتار فارسی در این صفحه در دسترس نیست؛ دستور را تایپ کنید. '
+  + 'اگر تنظیمات را تغییر دادید، صفحه را دوباره باز کنید.'
+
 /** A small, testable owner for one browser SpeechRecognition session. */
 export class PersianSpeechSession {
   private recognition: SpeechRecognitionLike | null = null
   private disposed = false
   private currentStatus: SpeechStatus = 'idle'
+  // Set when Safari refuses the speech service before the first `start` event (for example fa-IR is not available).
+  // Retrying in the same page load would ask for the same unavailable service again, so the session stops retrying.
+  private serviceUnavailable = false
 
   constructor(
     private readonly host: SpeechWindowLike,
@@ -144,6 +150,10 @@ export class PersianSpeechSession {
 
   start(): boolean {
     if (this.disposed) return false
+    if (this.serviceUnavailable) {
+      this.publishMessage(SERVICE_UNAVAILABLE_MESSAGE)
+      return false
+    }
     if (this.recognition) {
       if (openStatuses.has(this.currentStatus)) {
         this.publishMessage(this.currentStatus === 'stopping'
@@ -208,6 +218,7 @@ export class PersianSpeechSession {
       }
       recognition.onerror = (event) => {
         if (!this.isCurrent(recognition)) return
+        if (event.error === 'service-not-allowed' && this.currentStatus === 'starting') this.serviceUnavailable = true
         const result = speechErrorMessage(event.error ?? '')
         this.release(recognition, true)
         this.publishStatus(result.status)
