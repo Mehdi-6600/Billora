@@ -180,10 +180,25 @@ describe.skipIf(!present)('Shenava واقعی — امضای مدل و شکل ت
     for (let t = 0; t < frames; t += 1) {
       for (let d = 0; d < dim; d += 1) channelFirst[d * frames + t] = features[t * dim + d]!
     }
-    const encoded = await encoder.run({
-      audio_signal: new ort.Tensor('float32', channelFirst, [1, dim, frames]),
-      length: new ort.Tensor('int32', Int32Array.from([frames]), [1]),
-    })
+    // The real encoder wants an int64 length (the worker retries int32 → int64 the same way).
+    const runEncoder = async (dtype: 'int32' | 'int64') =>
+      encoder.run({
+        audio_signal: new ort.Tensor('float32', channelFirst, [1, dim, frames]),
+        length:
+          dtype === 'int64'
+            ? new ort.Tensor('int64', BigInt64Array.from([BigInt(frames)]), [1])
+            : new ort.Tensor('int32', Int32Array.from([frames]), [1]),
+      })
+
+    let encoded: ort.InferenceSession.OnnxValueMapType
+    let lengthDtype: 'int32' | 'int64' = 'int32'
+    try {
+      encoded = await runEncoder('int32')
+    } catch {
+      lengthDtype = 'int64'
+      encoded = await runEncoder('int64')
+    }
+    console.info(`[real] encoder length dtype: ${lengthDtype}`)
     const encodedOut = encoded[encoder.outputNames[0]!] as ort.Tensor
     const shape = (encodedOut.dims as readonly number[]).slice()
     console.info(`[real] encoder output: [${shape.join(', ')}]`)
