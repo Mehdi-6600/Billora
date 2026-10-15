@@ -362,8 +362,12 @@ button:disabled { cursor: not-allowed !important; opacity: .6; }
 .voice-button.speech-error { color: #a94743; background: #fff5f3; border-color: #f1d8d5; }
 .voice-button.speech-complete { color: #347c64; background: #f0f8f3; border-color: #d8eae0; }
 .voice-button:disabled { color: #a9b3ac; background: #f8f9f7; border-style: dashed; cursor: not-allowed; }
-.engine-toggle { display: inline-flex; align-items: center; justify-content: center; gap: 5px; min-width: 61px; height: 39px; padding: 0 9px; color: #4f7f6b; background: #f2f8f4; border: 1px solid #dcebe1; border-radius: 8px; cursor: pointer; font-size: 9px; }
-.engine-toggle:hover { color: var(--green-800); background: #e9f4ed; }
+.command-meta-row { display: flex; align-items: center; gap: 8px; margin-top: 6px; }
+.engine-badge { display: inline-flex; align-items: center; gap: 5px; padding: 3px 8px; color: #4f7f6b; background: #f2f8f4; border: 1px solid #e1ece6; border-radius: 999px; font-size: 8px; font-weight: 600; line-height: 1.4; }
+.engine-badge-offline { color: #68563b; background: #fbf5ea; border-color: #f0e3d1; }
+.engine-badge-browser { color: #4f7f6b; background: #eef6f1; border-color: #dcebe1; }
+.engine-switch-link { padding: 0; color: #6f8078; background: none; border: 0; cursor: pointer; font-size: 8px; text-decoration: underline; text-underline-offset: 2px; }
+.engine-switch-link:hover { color: var(--green-800); }
 .offline-engine-note { display: flex; align-items: flex-start; gap: 6px; margin-top: 8px; padding: 8px 10px; color: #7c6a5c; background: #fdf7f0; border: 1px solid #f2e4d5; border-radius: 8px; font-size: 8px; line-height: 1.8; }
 .offline-engine-note svg { flex: 0 0 14px; margin-top: 1px; color: #b98a5a; }
 .voice-disclaimer { margin: 8px 0 0; color: #9da7a0; font-size: 8px; line-height: 1.8; }
@@ -566,6 +570,20 @@ button:disabled { cursor: not-allowed !important; opacity: .6; }
   .invoice-save-footer { margin-right: -11px; margin-left: -11px; padding-right: 11px; padding-left: 11px; }
   .invoice-save-footer > span { max-width: 115px; line-height: 1.6; }
   .voice-disclaimer { font-size: 7px; }
+  /* iOS Safari auto-zooms the page when any focused input has font-size < 16px.
+     Bump all form controls to 16px on narrow (touch) screens; they don't look bigger because Safari
+     applies its own zoom compensation to the viewport. Pinch-zoom is still available. */
+  .field input, .field textarea, .field select,
+  .command-input-row > input,
+  .search-field input,
+  .line-product-field > input,
+  .line-number-field input,
+  .line-price-field input,
+  .line-discount-field input,
+  .invoice-discount-input input,
+  .command-target-picker select { font-size: 16px; }
+  .field input, .field textarea, .field select, .command-input-row > input { min-height: 44px; }
+  .line-product-field > input, .line-number-field input, .line-price-field input, .line-discount-field input { height: 36px; font-size: 16px; }
 }
 
 @media (prefers-reduced-motion: reduce) {

@@ -330,7 +330,16 @@ export function InvoiceEditorPage({
   const micButtonListening = offlineActive ? offline.status === 'listening' : speechStatus === 'listening'
   const micButtonError = offlineActive ? offlineFailed : speechError
   const micButtonComplete = offlineActive ? offline.status === 'result' : speechStatus === 'result'
-  const micButtonDisabled = offlineActive && !offlineAvailable
+  // Disable the mic button only when nothing can listen: iOS without the offline model, or the
+  // browser has no Web Speech and the offline engine isn't there either. Otherwise let it show the
+  // user-facing error message when clicked.
+  // Only block clicks completely when the browser has no speech support at all AND the offline
+  // engine is unavailable. Otherwise let the click surface a proper error (permission denied,
+  // service not available, model download needed, …).
+  // Keep the mic button clickable so a user who taps it always gets a clear, actionable message
+  // instead of a dead button. The click handler refuses to start when no engine can run and shows
+  // the proper error copy via `offline.message` / `commandMessage`.
+  const micButtonDisabled = false
   const handleMicClick = offlineActive
     ? (offlineBusy ? offline.stop : offline.start)
     : (speechBusy ? () => recognitionRef.current?.stop() : startListening)
@@ -433,17 +442,30 @@ export function InvoiceEditorPage({
       <section className="command-panel panel">
         <div className="command-heading"><span className="command-heading-icon"><Sparkles size={18} /></span><div><span className="panel-kicker">پردازش محلی · بدون API هوش مصنوعی</span><h2>دستور متنی فارسی</h2><p>برای فاکتور یا فهرست محصولات، یکی از دستورهای مشخص را بنویسید.</p></div></div>
         <div className="command-input-row">
-          <input value={commandText} onChange={(event) => { setCommandText(event.target.value); setCommandMessage('') }} onKeyDown={(event) => { if (event.key === 'Enter' && !event.shiftKey) { event.preventDefault(); runCommand() } }} placeholder="مثلاً: سه عدد شیر به فاکتور اضافه کن" aria-label="نوشتن دستور فارسی" />
-          <button type="button" className={`voice-button${offlineActive ? ' offline-voice-button' : ''}${micButtonListening ? ' listening' : ''}${micButtonError ? ' speech-error' : ''}${micButtonComplete ? ' speech-complete' : ''}`} onClick={handleMicClick} disabled={micButtonDisabled} aria-label={micButtonLabel} title={offlineActive ? 'تشخیص گفتار روی دستگاه؛ صدا از این دستگاه خارج نمی‌شود' : 'تشخیص گفتار مرورگر؛ آفلاین تضمین نمی‌شود'}>{micButtonBusy ? <MicOff size={17} /> : micButtonComplete ? <Check size={17} /> : <Mic size={17} />}<span>{micButtonText}</span></button>
-          {offlineActive && Boolean(getSpeechRecognitionConstructor(window)) && <button type="button" className="engine-toggle" aria-label="استفاده از تشخیص گفتار مرورگر" title="تشخیص گفتار مرورگر؛ ممکن است به اینترنت نیاز داشته باشد" onClick={() => { setEnginePreference('browser'); offline.cancel() }}><Mic size={15} /><span>مرورگر</span></button>}
-          {!offlineActive && offlineAvailable && <button type="button" className="engine-toggle" aria-label="تشخیص گفتار آفلاین روی دستگاه" title="تشخیص گفتار آفلاین شنوا؛ صدا از این دستگاه خارج نمی‌شود" onClick={() => { setEnginePreference('offline'); offline.start() }}><Sparkles size={15} /><span>آفلاین</span></button>}
-          {!offlineActive && !offlineAvailable && offlineHintNeeded && <button type="button" className="engine-toggle" disabled aria-label="موتور تشخیص گفتار آفلاین در دسترس نیست؛ متن را دستی وارد کنید" title="موتور تشخیص گفتار آفلاین در دسترس نیست؛ متن را دستی وارد کنید"><Sparkles size={15} /><span>آفلاین</span></button>}
+          <input value={commandText} onChange={(event) => { setCommandText(event.target.value); setCommandMessage('') }} onKeyDown={(event) => { if (event.key === 'Enter' && !event.shiftKey) { event.preventDefault(); runCommand() } }} placeholder="مثلاً: سه عدد شیر به فاکتور اضافه کن" aria-label="نوشتن دستور فارسی" enterKeyHint="send" />
+          <button type="button" className={`voice-button${offlineActive ? ' offline-voice-button' : ''}${micButtonListening ? ' listening' : ''}${micButtonError ? ' speech-error' : ''}${micButtonComplete ? ' speech-complete' : ''}`} onClick={handleMicClick} disabled={micButtonDisabled} aria-label={micButtonLabel} title={offlineActive ? 'دکمهٔ میکروفن — گفتار روی همین دستگاه پردازش می‌شود' : 'دکمهٔ میکروفن — گفتار با سرویس مرورگر پردازش می‌شود'}>{micButtonBusy ? <MicOff size={17} /> : micButtonComplete ? <Check size={17} /> : <Mic size={17} />}<span>{micButtonText}</span></button>
           <button type="button" className="button button-primary command-run" onClick={runCommand}>اجرای دستور</button>
+        </div>
+        <div className="command-meta-row">
+          {offlineActive
+            ? <span className="engine-badge engine-badge-offline"><Sparkles size={13} />روی دستگاه (آفلاین)</span>
+            : <span className="engine-badge engine-badge-browser"><Mic size={13} />با سرویس مرورگر</span>}
+          {(offlineAvailable && Boolean(getSpeechRecognitionConstructor(window))) && (
+            <button type="button" className="engine-switch-link" onClick={() => {
+              if (offlineActive) {
+                setEnginePreference('browser')
+                offline.cancel()
+              } else {
+                setEnginePreference('offline')
+                offline.start()
+              }
+            }}>{offlineActive ? 'استفاده از سرویس مرورگر' : 'استفاده از موتور آفلاین'}</button>
+          )}
         </div>
         {offlineNoteVisible && <div className="offline-engine-note" aria-live="polite"><CircleHelp size={14} />{offline.message || OFFLINE_SPEECH_MESSAGES.modelMissing}</div>}
         <p className="voice-disclaimer">{offlineActive
-          ? 'موتور آفلاین «شنوا کوچیک» صدا را کامل روی همین دستگاه پردازش می‌کند و به اینترنت نیازی ندارد. متن شنیده‌شده خودکار اجرا نمی‌شود و پیش از اجرا قابل ویرایش است.'
-          : 'تشخیص گفتار فقط به Web Speech API مرورگر وابسته است؛ پشتیبانی فارسی و کارکرد آفلاین تضمین نمی‌شود و ممکن است به اینترنت یا مجوز میکروفن نیاز داشته باشد. بعضی مرورگرها صدا را برای پردازش به سرویس گفتار خود می‌فرستند. متن شنیده‌شده خودکار اجرا نمی‌شود.'}</p>
+          ? 'صدا روی همین دستگاه پردازش می‌شود و به اینترنت فرستاده نمی‌شود. متن شنیده‌شده خودکار اجرا نمی‌شود و قبل از «اجرای دستور» قابل ویرایش است.'
+          : 'تشخیص گفتار با سرویس گفتار مرورگر انجام می‌شود؛ ممکن است به اینترنت نیاز داشته باشد. متن شنیده‌شده خودکار اجرا نمی‌شود.'}</p>
         {commandMessage && <div className="command-feedback" role="status"><CircleHelp size={16} />{commandMessage}</div>}
         <div className="command-examples"><span>نمونه‌ها:</span>{supportedCommandExamples.map((example) => <button type="button" key={example} onClick={() => { setCommandText(example); setCommandMessage('') }}>{example}</button>)}</div>
 
