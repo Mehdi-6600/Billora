@@ -799,4 +799,40 @@ describe('نصب‌کنندهٔ مدل شنوا — تقسیم فایل بزرگ
       files: { 'encoder.int8.onnx': { bytes: 10, sha256: 'aa', parts: [{ name: 'encoder.int8.onnx.part0', bytes: 10, sha256: 'bb' }] } },
     })
   })
+
+  it('فایل بالای سقف وقتی Hugging Face در دسترس نیست، از mirror دانلود و تقسیم می‌شود', async () => {
+    const fixture = await makeFixture({ files: 1, size: 10 })
+    const mirror = await startServer(fixture.payloads)
+    const dead = await startServer(new Map())
+    cleanups.push(
+      () => mirror.close(),
+      () => dead.close(),
+      () => rm(fixture.root, { recursive: true, force: true }),
+    )
+    const targetDir = join(fixture.root, 'out')
+    const cacheDir = join(fixture.root, 'cache')
+    const [spec] = fixture.manifest
+
+    // همان چیزی که در گردش‌کار CI اجرا می‌شود: Hugging Face خاموش، فقط mirror با ساختار flat
+    const summary = await runDownload({
+      targetDir,
+      cacheDir,
+      files: fixture.manifest,
+      endpoints: [dead.endpoint],
+      mirrors: [mirror.endpoint],
+      maxBytes: 4,
+      chunkBytes: 4,
+      logger: silentLogger,
+      sleep: async () => {},
+      attempts: 1,
+    })
+
+    assert.equal(summary.split, 1)
+    assert.equal(summary.failed, 0)
+    assert.ok(summary.errors.length === 0, JSON.stringify(summary.errors))
+    const entries = await readdir(targetDir)
+    assert.deepEqual(entries.sort(), [`${spec.name}.part0`, `${spec.name}.part1`, `${spec.name}.part2`, MODEL_PARTS_FILE])
+    // فایل کامل در کش می‌ماند تا build بعدی دوباره دانلود نکند
+    assert.equal(sha256(await readFile(join(cacheDir, spec.name))), spec.sha256)
+  })
 })

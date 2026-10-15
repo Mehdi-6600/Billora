@@ -354,29 +354,46 @@ export async function runDownload({
 
   const splitEntries = []
 
-  /** Downloads `spec` into the build cache when the copy there is missing or broken. */
+  /** Every source a file can come from, in order: Hugging Face hosts first, then flat mirrors. */
+  const sourcesFor = (name) => [
+    ...endpoints.map((endpoint) => ({ label: endpoint, url: modelFileUrl(name, { endpoint }) })),
+    ...mirrors.map((mirror) => ({ label: mirror, url: mirrorFileUrl(name, mirror) })),
+  ]
+
+  /**
+   * Downloads `spec` into the build cache when the copy there is missing or broken.
+   *
+   * This runs before splitting, so an oversized file must be obtainable from *any* configured host —
+   * a mirror-only setup (Hugging Face blocked) would otherwise fail right here.
+   */
   const ensureCached = async (path, spec, required = false) => {
     if (!path) return false
     const cached = await describeLocalFile(path, spec, { hashFile })
     if (cached.status === 'ok') return true
     if (check) return false
-    try {
-      await downloadFile({
-        url: modelFileUrl(spec.name, { endpoint: endpoints[0] }),
-        targetPath: path,
-        spec,
-        fetchImpl,
-        hashFile,
-        attempts,
-        sleep,
-      })
-      return true
-    } catch (error) {
-      if (required) {
-        summary.errors.push(`${spec.name}: ${error instanceof Error ? error.message : String(error)}`)
+    let lastError = null
+    for (const candidate of sourcesFor(spec.name)) {
+      logger.log(`GET   ${spec.name} (${formatBytes(spec.bytes)}) از ${candidate.label}`)
+      try {
+        await downloadFile({
+          url: candidate.url,
+          targetPath: path,
+          spec,
+          fetchImpl,
+          hashFile,
+          attempts,
+          sleep,
+        })
+        return true
+      } catch (error) {
+        lastError = error instanceof Error ? error : new Error(String(error))
+        logger.warn(`FAIL  ${spec.name} از ${candidate.label}: ${lastError.message}`)
       }
-      return false
     }
+    if (required) {
+      summary.errors.push(`${spec.name}: ${lastError?.message ?? 'no source could serve the file'}`)
+    }
+    return false
   }
 
   const summary = {
@@ -522,7 +539,7 @@ export async function runDownload({
     const sources = [
       ...endpoints.map((endpoint) => ({ label: endpoint, url: modelFileUrl(spec.name, { endpoint }), source: 'network' })),
       ...mirrors.map((mirror) => ({ label: mirror, url: mirrorFileUrl(spec.name, mirror), source: 'mirror' })),
-    ]
+    ].filter((entry, index, all) => all.findIndex((other) => other.url === entry.url) === index)
     for (const candidate of sources) {
       const { url, label, source } = candidate
       logger.log(`GET   ${spec.name} (${formatBytes(spec.bytes)}) از ${label}`)
