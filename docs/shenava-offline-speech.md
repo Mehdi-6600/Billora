@@ -162,13 +162,32 @@ GET https://billora-ai-image-app.vercel.app/models/shenava/tokens.txt        →
 
 حتی پس از برداشتن آن دیوار، انکودر ۱۳۱ مگابایتی به‌خاطر سقف ۱۰۰ مگابایتی فایل استاتیک در پلن Hobby در `dist` حاضر نیست (فقط decoder/joiner/tokens همراه build می‌آیند و همین باعث می‌شود استقرار موفق شود). پس برای «هم‌مبدأ بودن انکودر» یا باید به پلن Pro رفت، یا از Vercel Blob / Cloudflare R2 / CDN خودتان استفاده کرد و `VITE_SHENAVA_MODEL_BASE_URL` را به آن نشان داد؛ در همهٔ این حالت‌ها `npm run verify:deployed` حکم نهایی را می‌دهد. صفحهٔ تشخیص هم برای همین ساخته شده: ستون «نهائی» هر فایل منبع واقعی (محلی یا میزبان بیرونی) را نشان می‌دهد.
 
-### ۵) گردش‌کار GitHub و ابزار بررسی
+### ۵) میزبان جایگزین برای انکودر: Vercel Blob (آماده؛ یک Secret فاصله دارد)
+
+اگر می‌خواهید انکودر ۱۳۱ مگابایتی هم از یک میزبان تحت کنترل خودتان (نه Hugging Face) بیاید، مسیر آماده است:
+
+```bash
+# ۱) در Vercel → Storage → Blob یک Store عمومی بسازید و توکن آن را به‌عنوان Secret مخزن بگذارید:
+#    BLOB_READ_WRITE_TOKEN
+# ۲) توکن را در محیط خود یا در Secret مخزن بگذارید و آپلود را اجرا کنید:
+BLOB_READ_WRITE_TOKEN=vercel_blob_rw_… npm run upload:model -- --report=blob-report.json
+# خروجی پایانی این خط را چاپ می‌کند:  VITE_SHENAVA_MODEL_BASE_URL=https://<store>.public.blob.vercel-storage.com/shenava-model
+# ۳) همان متغیر را در Vercel (Environment Variables) بگذارید و دوباره deploy کنید.
+# ۴) اثبات: npm run verify:deployed -- https://<آدرس برنامه>
+```
+
+`scripts/upload-shenava-model.mjs` (۱۰ تست واحد) هر چهار فایل را با حجم و SHA-256 تأیید و در مسیر `shenava-model/` آپلود می‌کند (`multipart` برای فایل بزرگ، `addRandomSuffix: false` تا نام‌ها پایدار بمانند) و گزارش JSON با آدرس هر فایل می‌نویسد. گردش‌کار `.github/workflows/shenava-model.yml` هم اگر `BLOB_READ_WRITE_TOKEN` در Secrets باشد، همین آپلود را انجام می‌دهد، **هدرهای واقعی فایل آپلودشده را با `Origin` اندازه می‌گیرد** (برای اطمینان از `access-control-allow-origin` زیر COEP) و آدرس پایه را در گزارش Issue می‌گذارد؛ بدون آن Secret، گام بی‌صدا رد می‌شود.
+
+> صداقت: مسیر شبکهٔ این آپلود تا وقتی این توکن وجود نداشته باشد **آزمایش نشده** است (منطق آدرس‌سازی، بررسی حجم و گزارش‌دهی‌اش تست واحد دارد). اگر Blob هدر CORS نفرستد، همان گام اندازه‌گیری این را نشان می‌دهد و در آن حالت باید Cloudflare R2 یا CDN خودتان با `VITE_SHENAVA_MODEL_BASE_URL` استفاده شود؛ کد سمت برنامه برای هر میزبانی که `<base>/<fileName>` را با هدر CORS بدهد یکی است.
+
+### ۶) گردش‌کار GitHub و ابزار بررسی
 
 | ابزار | کار |
 | --- | --- |
 | `.github/workflows/shenava-model.yml` | دستی (`workflow_dispatch`): دانلود `--strict` + گزارش JSON، `--check`، build و تأیید حضور مدل در `dist`، انتشار Release به‌عنوان mirror، اندازه‌گیری هدرهای mirror و Hugging Face، probe خواندنی دامنهٔ Production، بررسی اختیاری استقرار با `verify:deployed`، و ثبت همهٔ این‌ها به‌صورت کامنت در Issue |
 | `npm run model:download` / `model:check` | نصب و بررسی مدل روی هر ماشین (بی‌خطر برای build) |
 | `npm run verify:deployed -- <url>` | حکم دربارهٔ یک استقرار واقعی: COOP/COEP، صفحهٔ تشخیص و چهار فایل مدل (status، نوع محتوا، حجم)؛ کد خروج ۰/۱ |
+| `npm run upload:model` | آپلود چهار فایل در یک میزبان بیرونی (Vercel Blob) و چاپ `VITE_SHENAVA_MODEL_BASE_URL` |
 
 ## جداسازی Cross-Origin (برای چندرشته‌ای شدن WASM)
 
@@ -191,6 +210,7 @@ Cross-Origin-Resource-Policy: same-origin
 | تست‌های واحد موتور (ویژگی‌ها، توکنایزر، RNNT، ITN، probe، worker، آدرس‌سازی) | ✅ `npm test` |
 | تست‌های نصب‌کنندهٔ مدل (۲۹ تست با سرور HTTP محلی، شامل mirror و گزارش JSON) | ✅ `npm test` → `node --test scripts/…` |
 | تست‌های ابزار بررسی استقرار (۱۶ تست، شامل تلهٔ پاسخ HTML) | ✅ `npm test` → `node --test scripts/…` |
+| تست‌های آپلود مدل در Blob (۱۰ تست، بدون شبکه) | ✅ `npm test` → `node --test scripts/…` |
 | `npm run typecheck` | ✅ |
 | `npm run build` + بررسی خروجی `dist/assets` | ✅ (با مدل غایب: هشدار و ادامهٔ build) |
 | دانلود خودکار در build با میزبان واقعی (Hugging Face) | ✅ روی GitHub runner: هر چهار فایل، `136719856` بایت در `4272 ms`، هش‌ها مطابق فهرست مدل (جدول بخش «شواهد») |

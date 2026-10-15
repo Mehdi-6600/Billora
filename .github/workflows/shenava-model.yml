@@ -53,6 +53,9 @@ jobs:
       RELEASE_TAG: ${{ github.event.inputs.release_tag || 'shenava-model-v1.5-int8' }}
       VERIFY_URL: ${{ github.event.inputs.verify_deployed_url || '' }}
       REPORT_ISSUE: ${{ github.event.inputs.report_issue || '8' }}
+      # اختیاری: اگر این Secret در مخزن باشد، مدل در Vercel Blob آپلود می‌شود و آدرس پایهٔ
+      # عمومی + هدرهای واقعی‌اش اندازه‌گیری و گزارش می‌شود (میزبان جایگزین انکودر ۱۳۱ مگابایتی).
+      BLOB_TOKEN: ${{ secrets.BLOB_READ_WRITE_TOKEN }}
     steps:
       - name: Check out source
         uses: actions/checkout@v4
@@ -162,6 +165,44 @@ jobs:
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
 
+      # میزبان جایگزین (اولویت کاربر): Vercel Blob. بدون Secret، گام بی‌صدا رد می‌شود.
+      - name: Upload the model to Vercel Blob (optional — needs the BLOB_READ_WRITE_TOKEN secret)
+        if: env.BLOB_TOKEN != ''
+        continue-on-error: true
+        env:
+          BLOB_READ_WRITE_TOKEN: ${{ env.BLOB_TOKEN }}
+        run: |
+          set -uo pipefail
+          node scripts/upload-shenava-model.mjs --dir=public/models/shenava --prefix=shenava-model \
+            --report=blob-report.json --quiet || true
+          BASE=$(node -e "try{const r=require('./blob-report.json'); if(r.baseUrl) console.log(r.baseUrl)}catch(e){}")
+          ENC=$(node -e "try{const r=require('./blob-report.json'); const f=r.files.find(x=>x.name==='encoder.int8.onnx'); if(f) console.log(f.url)}catch(e){}")
+          if [ -n "$ENC" ]; then
+            {
+              echo "baseUrl: $BASE"
+              echo "--- encoder headers (GET with Origin, first byte) ---"
+              curl -sS -m 60 -o /dev/null -D - -r 0-0 -H "Origin: https://billora.example" "$ENC" \
+                | grep -iE '^(HTTP/|content-type|content-length|content-range|access-control|cross-origin|location)' || true
+            } > blob-headers.txt
+            cat blob-headers.txt
+            echo
+            echo "این را در Vercel به‌عنوان Environment Variable بگذارید:"
+            echo "VITE_SHENAVA_MODEL_BASE_URL=$BASE"
+          fi
+          {
+            echo '### آپلود در Vercel Blob (میزبان جایگزین)'
+            echo '```json'
+            cat blob-report.json 2>/dev/null || echo '{}'
+            echo '```'
+            if [ -f blob-headers.txt ]; then
+              echo
+              echo '```'
+              cat blob-headers.txt
+              echo '```'
+            fi
+          } > blob-verify.txt
+          cat blob-verify.txt
+
       # Read-only proof about what the live site actually answers. This settles Q1 with real HTTP
       # responses instead of guesses: the deployment domains sit behind Vercel Authentication, so an
       # anonymous request can never return the model file — the exact response says why.
@@ -227,6 +268,10 @@ jobs:
             if [ -f mirror-verify.txt ]; then
               echo
               cat mirror-verify.txt
+            fi
+            if [ -f blob-verify.txt ]; then
+              echo
+              cat blob-verify.txt
             fi
             if [ -f live-probe.txt ]; then
               echo
