@@ -122,11 +122,15 @@ jobs:
         run: |
           set -euo pipefail
           URL="https://huggingface.co/Reza2kn/Shenava-Koochik-v1.5-RNNT-sherpa-onnx/resolve/main/encoder.int8.onnx"
-          echo "url: $URL" > hf-headers.txt
-          # A browser on a COEP: require-corp page may only read this response when it is CORS-approved.
-          curl -sSL -o /dev/null -D - -H 'Origin: https://billora.example' -H 'Range: bytes=0-0' "$URL" \
-            | grep -iE '^(HTTP/|content-type|content-length|content-range|access-control-allow-origin|access-control-expose-headers|cross-origin-resource-policy|location)' \
-            | tee -a hf-headers.txt || true
+          FILTER='^(HTTP/|access-control|content-type|content-range|content-length|cross-origin|location)'
+          {
+            echo "url: $URL"
+            echo "--- plain GET with Origin (what the worker does when it downloads) ---"
+            curl -sS -L -o /dev/null -D - -H 'Origin: https://billora.example' "$URL" | grep -iE "$FILTER"
+            echo "--- HEAD with Origin (what the model probe does first) ---"
+            curl -sS -L -o /dev/null -D - -I -H 'Origin: https://billora.example' "$URL" | grep -iE "$FILTER"
+          } > hf-headers.txt 2>&1 || true
+          cat hf-headers.txt
           {
             echo '### Hugging Face resolve headers'
             echo '```'
