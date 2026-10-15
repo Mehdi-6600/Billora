@@ -307,6 +307,7 @@ function DiagnosticPage() {
         <MetricRow label="threads مورد استفادهٔ ORT" value={info ? String(info.threads) : '—'} />
         <MetricRow label="blankId / vocab" value={info ? `${info.blankId} / ${info.vocabSize}` : '—'} />
         <MetricRow label="منبع فایل‌ها" value={info ? Object.entries(info.sources).map(([file, source]) => `${file}=${source}`).join('، ') : '—'} />
+        <MetricRow label="شکل تنسورهای RNNT" value={info?.transducerPlan ?? '—'} />
         {!availability?.available && (
           <p className="hint">
             برای نصب مدل، روی رایانه‌ای با اینترنت: <code>npm run model:download</code> — سپس فایل‌ها در
