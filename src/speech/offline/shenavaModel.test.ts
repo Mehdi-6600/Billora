@@ -1,9 +1,14 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import {
+  currentBaseHref,
+  resolveAbsoluteUrl,
+  resolveShenavaWorkerUrls,
   SHENAVA_MODEL_FILES,
-  probeShenavaModel,
+  shenavaModelDirectoryUrl,
   shenavaModelUrl,
+  shenavaOrtDirectoryUrl,
   shenavaRuntimeSupported,
+  probeShenavaModel,
 } from './shenavaModel'
 
 interface FakeResponse {
@@ -140,6 +145,35 @@ describe('شناسایی نصب‌بودن مدل روی دستگاه', () => {
     expect(fetcher.mock.calls.every(([url]) => String(url).startsWith('/'))).toBe(true)
   })
 
+  it('اگر بخشی از مدل همراه برنامه و بقیه روی Hub باشد، منبع mixed و موتور در دسترس است', async () => {
+    stubRuntime(true)
+    const encoder = SHENAVA_MODEL_FILES[0]
+    const fetcher = vi.fn(async (url: string) => {
+      const file = SHENAVA_MODEL_FILES.find((entry) => url.endsWith(entry.name))!
+      if (url.startsWith('/models/')) {
+        // مثل حالتی که میزبان فایل بزرگ را همراه build نمی‌پذیرد و فقط فایل‌های کوچک منتشر شده‌اند
+        return file.name === encoder.name ? { ok: false, status: 404, headers: { get: () => null } } : response({ 'content-length': String(file.bytes) })
+      }
+      return response({ 'content-length': String(file.bytes) })
+    })
+
+    const result = await probeShenavaModel(fetcher, '/', undefined, true, { allowRemote: true })
+    expect(result).toEqual({ available: true, missing: [], source: 'mixed' })
+  })
+
+  it('فایلی که نه محلی است و نه روی Hub، با نام در فهرست ناموجودها می‌آید', async () => {
+    stubRuntime(true)
+    const missingFile = SHENAVA_MODEL_FILES[2]
+    const fetcher = vi.fn(async (url: string) => {
+      const file = SHENAVA_MODEL_FILES.find((entry) => url.endsWith(entry.name))!
+      if (file.name === missingFile.name) return { ok: false, status: 404, headers: { get: () => null } }
+      return response({ 'content-length': String(file.bytes) })
+    })
+
+    const result = await probeShenavaModel(fetcher, '/', undefined, true, { allowRemote: true })
+    expect(result).toMatchObject({ available: false, missing: [missingFile.name], reason: 'missing' })
+  })
+
   it('بدون Web Worker یا WebAssembly حتی درخواستی فرستاده نمی‌شود', async () => {
     stubRuntime(false)
     const fetcher = vi.fn()
@@ -147,5 +181,92 @@ describe('شناسایی نصب‌بودن مدل روی دستگاه', () => {
     expect(result).toMatchObject({ available: false, reason: 'unsupported' })
     expect(fetcher).not.toHaveBeenCalled()
     expect(shenavaRuntimeSupported()).toBe(false)
+  })
+})
+
+describe('ساخت آدرس مطلق برای worker (باگ «Invalid base URL»)', () => {
+  const PAGE_VERCEL = 'https://billora.vercel.app/'
+  const WORKER_SCRIPT = 'https://billora.vercel.app/assets/shenava.worker-B8Il634R.js'
+  const PAGE_PAGES = 'https://mehdi-6600.github.io/Billora/'
+
+  it('پایهٔ نسبی همان چیزی است که در مرورگر خطا می‌داد و نباید دوباره استفاده شود', () => {
+    // سند این باگ: مرورگرها (و Node) پایهٔ نسبی را نمی‌پذیرند، پس `new URL(name, '/models/.../')`
+    // بلافاصله خطا می‌داد و موتور آفلاین هرگز شروع نمی‌شد.
+    expect(() => new URL('encoder.int8.onnx', '/models/shenava/')).toThrow()
+    expect(resolveAbsoluteUrl('encoder.int8.onnx', '/models/shenava/')).toBeNull()
+    expect(resolveAbsoluteUrl('encoder.int8.onnx', null)).toBeNull()
+  })
+
+  it('مسیرهای نسبی/مطلق را با href صفحه به آدرس مطلق تبدیل می‌کند', () => {
+    expect(shenavaModelDirectoryUrl()).toBe('/models/shenava/')
+    expect(shenavaModelDirectoryUrl('/Billora')).toBe('/Billora/models/shenava/')
+    expect(shenavaOrtDirectoryUrl('/Billora/')).toBe('/Billora/ort/')
+    expect(resolveAbsoluteUrl('/models/shenava/encoder.int8.onnx', PAGE_VERCEL))
+      .toBe('https://billora.vercel.app/models/shenava/encoder.int8.onnx')
+    expect(resolveAbsoluteUrl('models/shenava/tokens.txt', PAGE_PAGES))
+      .toBe('https://mehdi-6600.github.io/Billora/models/shenava/tokens.txt')
+    expect(resolveAbsoluteUrl('https://cdn.example.com/a.onnx', null)).toBe('https://cdn.example.com/a.onnx')
+  })
+
+  it('worker با baseUrl ویت، همهٔ آدرس‌ها را مطلق می‌سازد', () => {
+    const urls = resolveShenavaWorkerUrls({ baseUrl: '/', baseHref: WORKER_SCRIPT })
+    expect(urls.ortDirectoryUrl).toBe('https://billora.vercel.app/ort/')
+    expect(urls.modelFileUrl('encoder.int8.onnx')).toBe('https://billora.vercel.app/models/shenava/encoder.int8.onnx')
+    expect(urls.candidatesFor('tokens.txt')).toEqual([
+      { url: 'https://billora.vercel.app/models/shenava/tokens.txt', source: 'network' },
+    ])
+  })
+
+  it('مسیر مدلی که از thread اصلی می‌آید (مطلق یا نسبی) درست ترکیب می‌شود', () => {
+    const absolute = resolveShenavaWorkerUrls({
+      baseHref: WORKER_SCRIPT,
+      modelBaseUrl: '/models/shenava/',
+    })
+    expect(absolute.modelFileUrl('joiner.int8.onnx')).toBe('https://billora.vercel.app/models/shenava/joiner.int8.onnx')
+
+    // مسیر بدون اسلش پایانی هم باید درست ترکیب شود (thread اصلی همیشه اسلش پایانی می‌فرستد).
+    const noSlash = resolveShenavaWorkerUrls({ baseHref: WORKER_SCRIPT, modelBaseUrl: '/models/shenava' })
+    expect(noSlash.modelFileUrl('joiner.int8.onnx')).toBe('https://billora.vercel.app/models/shenava/joiner.int8.onnx')
+
+    // مسیر کاملاً نسبی، طبق قانون URL، نسبت به محل اسکریپت worker حل می‌شود (نه ریشهٔ سایت).
+    const relative = resolveShenavaWorkerUrls({ baseHref: WORKER_SCRIPT, modelBaseUrl: 'models/shenava/' })
+    expect(relative.modelFileUrl('joiner.int8.onnx'))
+      .toBe('https://billora.vercel.app/assets/models/shenava/joiner.int8.onnx')
+
+    const alreadyAbsolute = resolveShenavaWorkerUrls({
+      baseHref: WORKER_SCRIPT,
+      modelBaseUrl: 'https://billora.vercel.app/models/shenava/',
+    })
+    expect(alreadyAbsolute.modelFileUrl('decoder.int8.onnx'))
+      .toBe('https://billora.vercel.app/models/shenava/decoder.int8.onnx')
+  })
+
+  it('روی GitHub Pages مسیر پروژه حفظ می‌شود', () => {
+    const urls = resolveShenavaWorkerUrls({ baseUrl: '/Billora/', baseHref: PAGE_PAGES })
+    expect(urls.ortDirectoryUrl).toBe('https://mehdi-6600.github.io/Billora/ort/')
+    expect(urls.modelFileUrl('tokens.txt')).toBe('https://mehdi-6600.github.io/Billora/models/shenava/tokens.txt')
+  })
+
+  it('فایل محلی اول و کپی Hub دوم می‌آید', () => {
+    const urls = resolveShenavaWorkerUrls({
+      baseHref: WORKER_SCRIPT,
+      remoteModelUrls: { 'tokens.txt': 'https://huggingface.co/Reza2kn/Shenava-Koochik-v1.5-RNNT-sherpa-onnx/resolve/main/tokens.txt' },
+    })
+    expect(urls.candidatesFor('tokens.txt')).toEqual([
+      { url: 'https://billora.vercel.app/models/shenava/tokens.txt', source: 'network' },
+      { url: 'https://huggingface.co/Reza2kn/Shenava-Koochik-v1.5-RNNT-sherpa-onnx/resolve/main/tokens.txt', source: 'hub' },
+    ])
+  })
+
+  it('بدون پایهٔ مطلق، به‌جای آدرس خراب خطا می‌دهد', () => {
+    expect(() => resolveShenavaWorkerUrls({ baseHref: null })).toThrow('base URL is unknown')
+    expect(() => resolveShenavaWorkerUrls({ baseHref: '/index.html' })).toThrow(/cannot resolve/)
+  })
+
+  it('currentBaseHref فقط href غیرخالی را برمی‌گرداند', () => {
+    expect(currentBaseHref({ location: { href: PAGE_VERCEL } })).toBe(PAGE_VERCEL)
+    expect(currentBaseHref({ location: { href: '' } })).toBeNull()
+    expect(currentBaseHref({ location: {} })).toBeNull()
+    expect(currentBaseHref({})).toBeNull()
   })
 })

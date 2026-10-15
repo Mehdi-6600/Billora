@@ -55,8 +55,50 @@ export function shenavaHubUrl(fileName: string, endpoint = SHENAVA_HUB_ENDPOINT,
 
 /** Joins a Vite base URL (`/` or `/Billora/`) with the model directory. */
 export function shenavaModelUrl(fileName: string, baseUrl = '/'): string {
+  return `${shenavaModelDirectoryUrl(baseUrl)}${fileName}`
+}
+
+/** Site-absolute (or absolute) directory that holds the model files, always with a trailing slash. */
+export function shenavaModelDirectoryUrl(baseUrl = '/'): string {
   const base = baseUrl.endsWith('/') ? baseUrl : `${baseUrl}/`
-  return `${base}${SHENAVA_MODEL_DIRECTORY}/${fileName}`
+  return `${base}${SHENAVA_MODEL_DIRECTORY}/`
+}
+
+/** Directory that holds the ONNX Runtime Web runtime files (`public/ort/`, copied at build time). */
+export function shenavaOrtDirectoryUrl(baseUrl = '/'): string {
+  const base = baseUrl.endsWith('/') ? baseUrl : `${baseUrl}/`
+  return `${base}ort/`
+}
+
+/**
+ * Turns a path (or an already absolute URL) into an absolute URL.
+ *
+ * `baseHref` must itself be absolute. Browsers reject a relative base outright — the original bug
+ * here was `new URL('encoder.int8.onnx', '/models/shenava/')`, which throws `Invalid base URL` and
+ * killed the engine before a single byte was fetched. Callers pass `self.location.href` (worker) or
+ * `location.href` (page); `null` means "not resolvable here".
+ */
+export function resolveAbsoluteUrl(value: string, baseHref?: string | null): string | null {
+  try {
+    return new URL(value).href
+  } catch {
+    // Not absolute on its own: it needs a base.
+  }
+  if (baseHref) {
+    try {
+      return new URL(value, baseHref).href
+    } catch {
+      // Unusable base, fall through to `null`.
+    }
+  }
+  return null
+}
+
+/** `location.href` of the calling realm when it exists (page, worker, jsdom). */
+export function currentBaseHref(scope?: { location?: { href?: string } }): string | null {
+  const source = scope ?? (globalThis as { location?: { href?: string } })
+  const href = source?.location?.href
+  return typeof href === 'string' && href.length > 0 ? href : null
 }
 
 export interface ShenavaModelAvailability {
@@ -64,8 +106,70 @@ export interface ShenavaModelAvailability {
   missing: string[]
   /** `unsupported` when the runtime cannot run it at all, `unreachable` when the probe failed. */
   reason?: 'missing' | 'unreachable' | 'unsupported'
-  /** `local` when the files are served by the app itself, `hub` when they must be downloaded once. */
-  source?: 'local' | 'hub'
+  /**
+   * `local`: the app serves every file. `hub`: nothing is shipped, the browser downloads all four
+   * once. `mixed`: part of the model ships with the app and the rest comes from the Hub on first use
+   * (this is what happens when a host refuses files above its static size limit).
+   */
+  source?: 'local' | 'hub' | 'mixed'
+}
+
+export interface ShenavaWorkerUrlContext {
+  /** Vite base URL of the app (`/` or `/Billora/`). */
+  baseUrl?: string
+  /** Absolute `location.href` of the page (preferred) or of the worker script. */
+  baseHref?: string | null
+  /** Model directory supplied by the main thread; absolute or site-absolute. */
+  modelBaseUrl?: string
+  /** Same-origin file name → upstream URL, used when the local file is absent. */
+  remoteModelUrls?: Record<string, string>
+}
+
+export interface ShenavaWorkerUrls {
+  /** Directory ONNX Runtime Web loads its `.mjs`/`.wasm` from — always same-origin and absolute. */
+  ortDirectoryUrl: string
+  modelFileUrl: (fileName: string) => string
+  /** Local URL first, then the upstream copy (if the main thread supplied one). */
+  candidatesFor: (fileName: string) => { url: string; source: 'network' | 'hub' }[]
+}
+
+/**
+ * Builds every URL the worker needs, always absolutely.
+ *
+ * This used to be three inline `new URL(...)` calls inside the worker, where
+ * `new URL('encoder.int8.onnx', '/models/shenava/')` threw `Invalid base URL` in every browser and
+ * made the offline engine impossible to start. Keeping it here means it is covered by ordinary unit
+ * tests instead of only by a real device.
+ */
+export function resolveShenavaWorkerUrls(context: ShenavaWorkerUrlContext): ShenavaWorkerUrls {
+  const baseHref = context.baseHref ?? null
+  if (!baseHref) throw new Error('base URL is unknown: cannot resolve the model files')
+
+  const ortDirectoryUrl = resolveAbsoluteUrl(shenavaOrtDirectoryUrl(context.baseUrl ?? '/'), baseHref)
+  if (!ortDirectoryUrl) throw new Error(`cannot resolve the ONNX Runtime Web directory against ${baseHref}`)
+
+  const directory = context.modelBaseUrl ?? shenavaModelDirectoryUrl(context.baseUrl ?? '/')
+  const absoluteDirectory = resolveAbsoluteUrl(directory.endsWith('/') ? directory : `${directory}/`, baseHref)
+  if (!absoluteDirectory) throw new Error(`cannot resolve the model directory: ${directory}`)
+
+  const modelFileUrl = (fileName: string): string => {
+    const resolved = resolveAbsoluteUrl(fileName, absoluteDirectory)
+    if (!resolved) throw new Error(`cannot resolve the model file: ${fileName}`)
+    return resolved
+  }
+
+  return {
+    ortDirectoryUrl,
+    modelFileUrl,
+    candidatesFor: (fileName) => {
+      const candidates: { url: string; source: 'network' | 'hub' }[] = [
+        { url: modelFileUrl(fileName), source: 'network' },
+      ]
+      const remote = context.remoteModelUrls?.[fileName]
+      if (remote) candidates.push({ url: remote, source: 'hub' })
+      return candidates
+    },
+  }
 }
 
 export interface ShenavaProbeOptions {
@@ -160,32 +264,40 @@ export async function probeShenavaModel(
 
   const missing: string[] = []
   let unreachableCount = 0
+  let localHits = 0
 
   for (const file of files) {
     const state = await describeFile(fetcher, shenavaModelUrl(file.name, baseUrl), file.bytes)
     if (state === 'unreachable') unreachableCount += 1
-    if (state !== 'ok') missing.push(file.name)
+    if (state === 'ok') localHits += 1
+    else missing.push(file.name)
   }
 
   if (missing.length === 0) return { available: true, missing: [], source: 'local' }
 
   if (probeOptions.allowRemote) {
-    const remoteMissing: string[] = []
+    // A file only counts as lost when it is missing locally AND cannot be fetched upstream, so a
+    // partly shipped model (see SHENAVA_MODEL_MAX_BUILD_BYTES) still gives a working engine.
+    const goneEverywhere: string[] = []
     let remoteUnreachable = 0
     for (const file of files) {
+      if (!missing.includes(file.name)) continue
       const state = await describeFile(
         fetcher,
         shenavaHubUrl(file.name, probeOptions.hubEndpoint ?? SHENAVA_HUB_ENDPOINT),
         file.bytes,
       )
+      if (state === 'ok') continue
+      goneEverywhere.push(file.name)
       if (state === 'unreachable') remoteUnreachable += 1
-      if (state !== 'ok') remoteMissing.push(file.name)
     }
-    if (remoteMissing.length === 0) return { available: true, missing: [], source: 'hub' }
+    if (goneEverywhere.length === 0) {
+      return { available: true, missing: [], source: localHits > 0 ? 'mixed' : 'hub' }
+    }
     return {
       available: false,
-      missing,
-      reason: remoteUnreachable === files.length ? 'unreachable' : 'missing',
+      missing: goneEverywhere,
+      reason: remoteUnreachable === goneEverywhere.length ? 'unreachable' : 'missing',
     }
   }
 

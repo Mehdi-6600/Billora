@@ -46,8 +46,8 @@ export interface OfflineSpeechState {
   missingFiles: string[]
   metrics: ShenavaMetrics | null
   crossOriginIsolated: boolean
-  /** Where the model bytes come from: the app itself, or a one-time download from the Hub. */
-  modelSource: 'local' | 'hub' | null
+  /** Where the model bytes come from: the app itself, a one-time download, or a mix of both. */
+  modelSource: 'local' | 'hub' | 'mixed' | null
   canStart: boolean
   start: () => void
   stop: () => void
@@ -65,7 +65,7 @@ export function useOfflineSpeech(options: OfflineSpeechOptions): OfflineSpeechSt
   const [available, setAvailable] = useState<boolean | null>(null)
   const [missingFiles, setMissingFiles] = useState<string[]>([])
   const [metrics, setMetrics] = useState<ShenavaMetrics | null>(null)
-  const [modelSource, setModelSource] = useState<'local' | 'hub' | null>(null)
+  const [modelSource, setModelSource] = useState<'local' | 'hub' | 'mixed' | null>(null)
   const [progressSeconds, setProgressSeconds] = useState(0)
 
   const recognizerRef = useRef<ShenavaRecognizer | null>(null)
@@ -131,10 +131,13 @@ export function useOfflineSpeech(options: OfflineSpeechOptions): OfflineSpeechSt
         setModelSource(result.source ?? null)
         if (result.available) {
           // A remote model is downloaded once into the Cache API, then everything is offline.
-          applyStatus(
-            'ready',
-            result.source === 'hub' ? OFFLINE_SPEECH_MESSAGES.remoteModelDownload : OFFLINE_SPEECH_MESSAGES.ready,
-          )
+          const readyMessage =
+            result.source === 'hub'
+              ? OFFLINE_SPEECH_MESSAGES.remoteModelDownload
+              : result.source === 'mixed'
+                ? OFFLINE_SPEECH_MESSAGES.remoteModelPartial
+                : OFFLINE_SPEECH_MESSAGES.ready
+          applyStatus('ready', readyMessage)
         } else {
           applyStatus('unavailable', `${OFFLINE_SPEECH_MESSAGES.modelMissing}${result.missing.length ? ` (${result.missing.join('، ')})` : ''}`)
         }

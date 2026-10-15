@@ -9,7 +9,7 @@
 - `npm test` برای تست‌های محاسبات، دستورها، پشتیبان و IndexedDB
 - `npm run build` برای بررسی TypeScript و ساخت نسخهٔ Production
 - `npm run preview` برای دیدن خروجی Production
-- `npm run model:download` برای نصب مدل گفتار آفلاین (حدود ۱۳۷ مگابایت، در گیت ذخیره نمی‌شود)
+- `npm run model:download` برای نصب دستی مدل گفتار آفلاین (در زمان build خودکار انجام می‌شود؛ در گیت ذخیره نمی‌شود)
 - `npm run model:check` برای بررسی سالم‌بودن فایل‌های مدل نصب‌شده
 
 ## امکانات
@@ -28,7 +28,8 @@
 
 - صدا از مرورگر بیرون نمی‌رود و پس از نصب مدل، بدون اینترنت کار می‌کند.
 - متن نهایی فقط داخل ورودی فرمان می‌نشیند؛ هیچ دستوری خودکار اجرا نمی‌شود و اجرای دستی با «اجرای دستور» انجام می‌گیرد.
-- اگر مدل نصب نشده باشد، صفحهٔ تست مستقل: `/test-shenava.html` (با `npm run dev`). جزئیات معماری، هدرهای Cross-Origin، چک‌لیست تست روی iPhone/Android و محدودیت‌های تأییدنشده در [`docs/shenava-offline-speech.md`](docs/shenava-offline-speech.md).
+- مدل در زمان build دانلود می‌شود (`prebuild` → `scripts/download-shenava-model.mjs`) و اگر دانلود ناموفق باشد، build متوقف نمی‌شود؛ فقط موتور آفلاین غیرفعال می‌ماند (ورودی متنی و Web Speech API کار می‌کنند).
+- صفحهٔ تست مستقل: `/test-shenava.html` (با `npm run dev`). جزئیات معماری، هدرهای Cross-Origin، چک‌لیست تست روی iPhone/Android و محدودیت‌های تأییدنشده در [`docs/shenava-offline-speech.md`](docs/shenava-offline-speech.md).
 
 ## حریم خصوصی و محدودیت‌ها
 

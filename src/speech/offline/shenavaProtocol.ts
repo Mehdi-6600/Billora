@@ -33,6 +33,8 @@ export type ShenavaWorkerRequest =
   | {
       type: 'init'
       baseUrl: string
+      /** Absolute `location.href` used to resolve the paths below (workers reject relative bases). */
+      baseHref?: string
       modelBaseUrl?: string
       /** Same-origin file name → upstream URL, used only when the local file is absent. */
       remoteModelUrls?: Record<string, string>
