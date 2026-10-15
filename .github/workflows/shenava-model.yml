@@ -85,7 +85,7 @@ jobs:
           SHENAVA_MODEL_DIR: public/models/shenava
           SHENAVA_REAL_ENCODER: '1'
         run: |
-          npx vitest run src/speech/offline/shenavaRealModel.test.ts --reporter=basic 2>&1 | tee real-model.txt
+          npx vitest run src/speech/offline/shenavaRealModel.test.ts 2>&1 | tee real-model.txt
           {
             echo '### امضا و شکل تنسورهای مدل واقعی'
             echo '```'
