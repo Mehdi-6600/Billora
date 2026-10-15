@@ -728,6 +728,10 @@ describe('نصب‌کنندهٔ مدل شنوا — تقسیم فایل بزرگ
     assert.equal(checked.report[0].status, 'split')
 
     const [spec] = fixture.manifest
+    // `--check` must be read-only: the manifest is what tells the browser a file is split, so the
+    // earlier version of this script deleting it (nothing was written) broke the next build step.
+    const manifestAfterCheck = JSON.parse(await readFile(join(targetDir, MODEL_PARTS_FILE), 'utf8'))
+    assert.equal(manifestAfterCheck.files[spec.name].parts.length, 3)
     await rm(join(targetDir, `${spec.name}.part1`))
     const broken = await runDownload({ ...options, check: true, endpoints: ['http://127.0.0.1:1'] })
     assert.equal(broken.failed, 1)

@@ -579,8 +579,13 @@ export async function runDownload({
 
   // The manifest is the only thing the browser needs to know a file is split; a stale one would make
   // the probe believe in chunks that are no longer there, so its absence is written explicitly.
+  // `--check` is read-only: it verifies the parts *against* the manifest, so it must never rewrite or
+  // delete it (deleting it here used to break the very next build step).
   try {
-    if (splitEntries.length > 0) {
+    if (check) {
+      const manifest = await readPartsManifest(targetDir)
+      if (manifest) summary.partsManifest = MODEL_PARTS_FILE
+    } else if (splitEntries.length > 0) {
       await writePartsManifest(targetDir, buildPartsManifest(splitEntries, chunkBytes))
       summary.partsManifest = MODEL_PARTS_FILE
     } else {
