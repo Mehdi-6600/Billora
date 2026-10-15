@@ -118,6 +118,22 @@ jobs:
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
 
+      - name: Measure the Hugging Face CORS headers (the built-in fallback host)
+        run: |
+          set -euo pipefail
+          URL="https://huggingface.co/Reza2kn/Shenava-Koochik-v1.5-RNNT-sherpa-onnx/resolve/main/encoder.int8.onnx"
+          echo "url: $URL" > hf-headers.txt
+          # A browser on a COEP: require-corp page may only read this response when it is CORS-approved.
+          curl -sSL -o /dev/null -D - -H 'Origin: https://billora.example' -H 'Range: bytes=0-0' "$URL" \
+            | grep -iE '^(HTTP/|content-type|content-length|content-range|access-control-allow-origin|access-control-expose-headers|cross-origin-resource-policy|location)' \
+            | tee -a hf-headers.txt || true
+          {
+            echo '### Hugging Face resolve headers'
+            echo '```'
+            cat hf-headers.txt
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
       - name: Check the live deployment (optional)
         if: env.VERIFY_URL != ''
         continue-on-error: true
@@ -149,6 +165,13 @@ jobs:
             echo '--- dist ---'
             ls -l dist/models/shenava 2>/dev/null || echo 'dist/models/shenava empty'
             echo '```'
+            if [ -f hf-headers.txt ]; then
+              echo
+              echo '### هدرهای Hugging Face (منبع پشتیبان پیش‌فرض موتور)'
+              echo '```'
+              cat hf-headers.txt
+              echo '```'
+            fi
             if [ -f mirror-headers.txt ]; then
               echo
               echo '### هدرهای asset روی GitHub Release (فعال‌بودن fetch مرورگر)'
