@@ -10,12 +10,6 @@ const base = env.GITHUB_PAGES === 'true' ? '/Billora/' : '/'
 const assetUrl = (name: string) => `${base}${name}`
 
 /**
- * The offline speech engine runs ONNX Runtime Web with SharedArrayBuffer, which browsers only expose
- * to cross-origin isolated pages. Production sets these headers in `vercel.json`; the dev server
- * (and `vite preview`) need their own copy so `crossOriginIsolated === true` while developing.
- * GitHub Pages cannot send headers, so the engine degrades to a single thread there.
- */
-/**
  * ONNX Runtime Web ships its WASM runtime outside the package's `exports` map, so it cannot be
  * imported with `?url`. Copying the two files the engine needs into `public/ort/` keeps every
  * request same-origin, which both cross-origin isolation and offline use require.
@@ -36,6 +30,12 @@ function ortRuntimePlugin(): Plugin {
   }
 }
 
+/**
+ * The offline speech engine runs ONNX Runtime Web with SharedArrayBuffer, which browsers only expose
+ * to cross-origin isolated pages. Production sets these headers in `vercel.json`; the dev server
+ * (and `vite preview`) need their own copy so `crossOriginIsolated === true` while developing.
+ * GitHub Pages cannot send headers, so the engine degrades to a single thread there.
+ */
 const crossOriginIsolationHeaders = {
   'Cross-Origin-Opener-Policy': 'same-origin',
   'Cross-Origin-Embedder-Policy': 'require-corp',
@@ -81,6 +81,16 @@ export default defineConfig({
       devOptions: { enabled: false },
     }),
   ],
+  build: {
+    rollupOptions: {
+      input: {
+        main: fileURLToPath(new URL('./index.html', import.meta.url)),
+        // `/test-shenava.html` is built too, so the offline engine (and the model files) can be
+        // checked on a real phone — and on a deployed site — without running a dev server.
+        'test-shenava': fileURLToPath(new URL('./test-shenava.html', import.meta.url)),
+      },
+    },
+  },
   // ONNX Runtime Web must be kept out of the dev-time dependency pre-bundling, otherwise the WASM
   // loader and the `?url` assets it needs end up in two different module instances.
   optimizeDeps: { exclude: ['onnxruntime-web'] },
