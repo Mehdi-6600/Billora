@@ -106,12 +106,15 @@ jobs:
         run: |
           set -euo pipefail
           URL="https://github.com/${{ github.repository }}/releases/download/$TAG/encoder.int8.onnx"
-          echo "asset: $URL"
+          echo "asset: $URL" | tee mirror-headers.txt
+          # The 302 goes to a signed URL; `-L` follows it, which is exactly what a browser does.
+          curl -sSL -o /dev/null -D - -H 'Origin: https://billora.example' -H 'Range: bytes=0-0' "$URL" \
+            | grep -iE '^(HTTP/|content-type|content-length|content-range|access-control-allow-origin|access-control-expose-headers|cross-origin-resource-policy|vary)' \
+            | tee -a mirror-headers.txt || true
           {
             echo '### Release asset headers (encoder.int8.onnx)'
             echo '```'
-            curl -sSL -o /dev/null -D - -H 'Origin: https://billora.example' -H 'Range: bytes=0-0' "$URL" \
-              | grep -iE '^(HTTP/|content-type|content-length|content-range|access-control-allow-origin|access-control-expose-headers|cross-origin-resource-policy|vary)' || true
+            cat mirror-headers.txt
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
 
@@ -146,6 +149,13 @@ jobs:
             echo '--- dist ---'
             ls -l dist/models/shenava 2>/dev/null || echo 'dist/models/shenava empty'
             echo '```'
+            if [ -f mirror-headers.txt ]; then
+              echo
+              echo '### هدرهای asset روی GitHub Release (فعال‌بودن fetch مرورگر)'
+              echo '```'
+              cat mirror-headers.txt
+              echo '```'
+            fi
           } > report.md
           cat report.md
 
