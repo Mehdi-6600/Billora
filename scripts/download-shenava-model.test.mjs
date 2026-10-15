@@ -18,6 +18,8 @@ import {
   DEFAULT_TARGET_DIR,
   describeLocalFile,
   endpointsFromEnv,
+  mirrorFileUrl,
+  mirrorsFromEnv,
   formatBytes,
   main,
   modelFileUrl,
@@ -113,6 +115,18 @@ describe('نصب‌کنندهٔ مدل شنوا — توابع کمکی', () => 
     assert.equal(options.dir, '/tmp/x')
     assert.deepEqual(options.endpoints, ['https://a.test'])
     assert.throws(() => parseArgs(['--nope']), /unknown argument/)
+  })
+
+  it('آدرس mirror با ساختار flat ساخته می‌شود', () => {
+    assert.equal(
+      mirrorFileUrl('encoder.int8.onnx', 'https://github.com/o/r/releases/download/shenava-model-v1.5-int8/'),
+      'https://github.com/o/r/releases/download/shenava-model-v1.5-int8/encoder.int8.onnx',
+    )
+    assert.deepEqual(mirrorsFromEnv({}), [])
+    assert.deepEqual(mirrorsFromEnv({ SHENAVA_MODEL_MIRROR: 'https://a.test/x/, https://b.test/y' }), [
+      'https://a.test/x',
+      'https://b.test/y',
+    ])
   })
 
   it('میزبان‌ها را از HF_ENDPOINT می‌خواند', () => {
@@ -353,6 +367,58 @@ describe('نصب‌کنندهٔ مدل شنوا — دانلود و کش', () =>
     assert.equal(summary.downloaded, 1)
     assert.equal(dead.state.requests.length, 1)
     assert.equal(working.state.requests.length, 1)
+  })
+
+  it('وقتی میزبان‌های Hugging Face کار نکنند، از mirror دانلود می‌کند', async () => {
+    const fixture = await makeFixture({ files: 2 })
+    const mirror = await startServer(fixture.payloads)
+    const dead = await startServer(new Map())
+    cleanups.push(
+      () => mirror.close(),
+      () => dead.close(),
+      () => rm(fixture.root, { recursive: true, force: true }),
+    )
+    const logger = collectLogger()
+
+    const summary = await runDownload({
+      targetDir: join(fixture.root, 'out'),
+      files: fixture.manifest,
+      endpoints: [dead.endpoint],
+      mirrors: [mirror.endpoint],
+      logger,
+      sleep: async () => {},
+      attempts: 1,
+    })
+
+    assert.equal(summary.downloaded, 2)
+    assert.equal(summary.failed, 0)
+    assert.ok(summary.report.every((entry) => entry.source === 'mirror'))
+    assert.ok(summary.report.every((entry) => entry.endpoint === mirror.endpoint))
+    for (const spec of fixture.manifest) {
+      assert.equal(sha256(await readFile(join(fixture.root, 'out', spec.name))), spec.sha256)
+    }
+  })
+
+  it('mirror خراب (هش ناهمخوان) پذیرفته نمی‌شود', async () => {
+    const fixture = await makeFixture({ files: 1 })
+    const [spec] = fixture.manifest
+    // همان نام فایل، محتوای غلط: باید رد شود و build از آن استفاده نکند
+    const badMirror = await startServer(new Map([[spec.name, Buffer.alloc(spec.bytes, 99)]]))
+    cleanups.push(() => badMirror.close(), () => rm(fixture.root, { recursive: true, force: true }))
+
+    const summary = await runDownload({
+      targetDir: join(fixture.root, 'out'),
+      files: fixture.manifest,
+      endpoints: [],
+      mirrors: [badMirror.endpoint],
+      logger: silentLogger,
+      sleep: async () => {},
+      attempts: 1,
+    })
+
+    assert.equal(summary.failed, 1)
+    assert.equal(summary.downloaded, 0)
+    assert.match(summary.errors[0], /SHA-256 mismatch/)
   })
 
   it('شکست کامل دانلود، استثنا نمی‌دهد و فایل نیمه‌کاره باقی نمی‌گذارد', async () => {

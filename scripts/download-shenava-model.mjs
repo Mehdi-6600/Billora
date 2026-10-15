@@ -22,6 +22,7 @@
  *   node scripts/download-shenava-model.mjs --force         # re-download everything
  *   node scripts/download-shenava-model.mjs --strict        # fail the build when something is missing
  *   HF_ENDPOINT=https://hf-mirror.com node scripts/...      # restricted networks / mirrors
+ *   SHENAVA_MODEL_MIRROR=https://github.com/…/releases/download/<tag> node scripts/…   # flat mirror
  *
  * Environment:
  *   HF_ENDPOINT                 one or more comma-separated mirrors (default https://huggingface.co)
@@ -82,6 +83,17 @@ export function modelFileUrl(fileName, { endpoint = DEFAULT_ENDPOINT, revision =
   return `${endpoint.replace(/\/+$/, '')}/${MODEL_REPO}/resolve/${revision}/${fileName}`
 }
 
+/**
+ * Flat mirror URL (`<base>/<file>`), e.g. a GitHub Release created by `.github/workflows/shenava-model.yml`:
+ *   SHENAVA_MODEL_MIRROR=https://github.com/<owner>/<repo>/releases/download/shenava-model-v1.5-int8
+ *
+ * Mirrors are tried after the Hugging Face endpoints and every download is verified against the same
+ * size + SHA-256, so a stale or wrong mirror can never poison a build.
+ */
+export function mirrorFileUrl(fileName, mirrorBase) {
+  return `${mirrorBase.replace(/\/+$/, '')}/${fileName}`
+}
+
 export function formatBytes(bytes) {
   if (!Number.isFinite(bytes)) return '?'
   if (bytes >= 1_048_576) return `${(bytes / 1_048_576).toFixed(1)} MB`
@@ -91,7 +103,7 @@ export function formatBytes(bytes) {
 
 export function parseArgs(argv = []) {
   const flags = { check: false, force: false, strict: false, quiet: false }
-  const options = { dir: null, endpoints: [], maxBytes: null, reportPath: null }
+  const options = { dir: null, endpoints: [], mirrors: [], maxBytes: null, reportPath: null }
   for (const arg of argv) {
     if (arg === '--check') flags.check = true
     else if (arg === '--force') flags.force = true
@@ -99,12 +111,21 @@ export function parseArgs(argv = []) {
     else if (arg === '--quiet') flags.quiet = true
     else if (arg.startsWith('--dir=')) options.dir = arg.slice('--dir='.length)
     else if (arg.startsWith('--endpoint=')) options.endpoints.push(arg.slice('--endpoint='.length))
+    else if (arg.startsWith('--mirror=')) options.mirrors.push(arg.slice('--mirror='.length))
     else if (arg.startsWith('--max-bytes=')) options.maxBytes = Number(arg.slice('--max-bytes='.length))
     else if (arg.startsWith('--report=')) options.reportPath = arg.slice('--report='.length)
     else if (arg === '--help' || arg === '-h') flags.help = true
     else throw new Error(`unknown argument: ${arg}`)
   }
   return { flags, options }
+}
+
+export function mirrorsFromEnv(env = {}) {
+  const raw = env.SHENAVA_MODEL_MIRROR ?? env.SHENAVA_MODEL_MIRRORS ?? ''
+  return raw
+    .split(',')
+    .map((mirror) => mirror.trim().replace(/\/+$/, ''))
+    .filter((mirror) => mirror.length > 0)
 }
 
 export function endpointsFromEnv(env = {}) {
@@ -211,6 +232,8 @@ export async function runDownload({
   hashFile = sha256File,
   sleep,
   attempts = ATTEMPTS_PER_ENDPOINT,
+  /** Flat mirror directories, tried after `endpoints`. */
+  mirrors = [],
   /**
    * Optional budget for the files that end up next to the app (Vercel's static upload limit).
    * Files above it stay in the cache and are fetched by the browser from Hugging Face instead —
@@ -300,9 +323,13 @@ export async function runDownload({
     }
 
     let lastError = null
-    for (const endpoint of endpoints) {
-      const url = modelFileUrl(spec.name, { endpoint })
-      logger.log(`GET   ${spec.name} (${formatBytes(spec.bytes)}) از ${endpoint}`)
+    const sources = [
+      ...endpoints.map((endpoint) => ({ label: endpoint, url: modelFileUrl(spec.name, { endpoint }), source: 'network' })),
+      ...mirrors.map((mirror) => ({ label: mirror, url: mirrorFileUrl(spec.name, mirror), source: 'mirror' })),
+    ]
+    for (const candidate of sources) {
+      const { url, label, source } = candidate
+      logger.log(`GET   ${spec.name} (${formatBytes(spec.bytes)}) از ${label}`)
       const startedAt = Date.now()
       try {
         const { size } = await downloadFile({
@@ -319,13 +346,13 @@ export async function runDownload({
         summary.downloaded += 1
         summary.bytes += size
         summary.files.push({ name: spec.name, status: 'downloaded', size })
-        summary.report.push({ name: spec.name, status: 'downloaded', bytes: size, ms: elapsedMs, sha256: spec.sha256, endpoint })
+        summary.report.push({ name: spec.name, status: 'downloaded', bytes: size, ms: elapsedMs, sha256: spec.sha256, endpoint: label, source })
         logger.log(`OK    ${spec.name} دانلود و تأیید شد (${formatBytes(size)} در ${(elapsedMs / 1000).toFixed(1)} ثانیه)`)
         lastError = null
         break
       } catch (error) {
         lastError = error instanceof Error ? error : new Error(String(error))
-        logger.warn(`FAIL  ${spec.name} از ${endpoint}: ${lastError.message}`)
+        logger.warn(`FAIL  ${spec.name} از ${label}: ${lastError.message}`)
       }
     }
 
@@ -354,6 +381,7 @@ export function resolveConfiguration({ argv = process.argv.slice(2), env = proce
       ? envMaxBytes
       : null
   const endpoints = options.endpoints.length > 0 ? options.endpoints : endpointsFromEnv(env)
+  const mirrors = options.mirrors.length > 0 ? options.mirrors : mirrorsFromEnv(env)
   const disabled = env.SHENAVA_MODEL_DOWNLOAD === '0' || env.SHENAVA_MODEL_DOWNLOAD === 'false'
   const explicitToggle = env.SHENAVA_MODEL_DOWNLOAD === '1' || env.SHENAVA_MODEL_DOWNLOAD === 'true'
   // GitHub Pages cannot send COOP/COEP and would have to ship ~137 MB in its artifact, so the
@@ -362,9 +390,11 @@ export function resolveConfiguration({ argv = process.argv.slice(2), env = proce
   return {
     flags,
     endpoints,
+    mirrors,
     disabled,
     skippedForPages,
     maxBytes,
+    mirrors: mirrorsFromEnv(env),
     targetDir: resolvePath(options.dir ?? env.SHENAVA_MODEL_DIR ?? DEFAULT_TARGET_DIR, cwd),
     cacheDir: resolvePath(env.SHENAVA_MODEL_CACHE_DIR ?? DEFAULT_CACHE_DIR, cwd),
     manifestPath: resolvePath(env.SHENAVA_MODEL_MANIFEST, cwd),
@@ -382,10 +412,12 @@ const HELP = `نصب مدل گفتار آفلاین شنوا کوچیک ۱.۵ (i
   --quiet      کم‌ترین خروجی
   --dir=...    مسیر مقصد (پیش‌فرض public/models/shenava)
   --report=... نوشتن گزارش JSON (حجم، زمان، SHA-256 هر فایل)
-  --endpoint=...  میزبان جایگزین (چند بار قابل تکرار)
+  --endpoint=...  میزبان جایگزین با ساختار Hugging Face (چند بار قابل تکرار)
+  --mirror=...    پوشهٔ flat مدل (مثلاً GitHub Release؛ چند بار قابل تکرار)
 
-  متغیرهای محیطی: HF_ENDPOINT، SHENAVA_MODEL_DOWNLOAD، SHENAVA_MODEL_DIR،
-  SHENAVA_MODEL_CACHE_DIR، SHENAVA_MODEL_MANIFEST`
+  متغیرهای محیطی: HF_ENDPOINT، SHENAVA_MODEL_MIRROR، SHENAVA_MODEL_DOWNLOAD،
+  SHENAVA_MODEL_DIR، SHENAVA_MODEL_CACHE_DIR، SHENAVA_MODEL_MANIFEST،
+  SHENAVA_MODEL_MAX_BUILD_BYTES، SHENAVA_MODEL_REPORT`
 
 export async function main({ argv = process.argv.slice(2), env = process.env, cwd = process.cwd(), logger = console } = {}) {
   const config = resolveConfiguration({ argv, env, cwd })
@@ -409,13 +441,14 @@ export async function main({ argv = process.argv.slice(2), env = process.env, cw
   const total = files.reduce((sum, file) => sum + (file.bytes ?? 0), 0)
   logger.log(`مدل: ${MODEL_REPO}`)
   logger.log(`مقصد: ${config.targetDir}${config.flags.check ? ' (فقط بررسی)' : ''}`)
-  logger.log(`حجم کل: ${formatBytes(total)} · منابع: ${config.endpoints.join(', ')}`)
+  logger.log(`حجم کل: ${formatBytes(total)} · منابع: ${[...config.endpoints, ...config.mirrors].join(', ')}`)
 
   const summary = await runDownload({
     targetDir: config.targetDir,
     cacheDir: config.cacheDir,
     files,
     endpoints: config.endpoints,
+    mirrors: config.mirrors,
     force: config.flags.force && !config.flags.check,
     maxBytes: config.maxBytes,
     logger: config.flags.quiet ? { log: () => {}, warn: () => {} } : logger,
@@ -432,6 +465,7 @@ export async function main({ argv = process.argv.slice(2), env = process.env, cw
       totalMs: Date.now() - summary.startedAt,
       totalBytes: summary.bytes,
       endpoints: config.endpoints,
+      mirrors: config.mirrors,
       counts: {
         downloaded: summary.downloaded,
         copied: summary.copied,

@@ -76,6 +76,34 @@ jobs:
       - name: Verify sizes and SHA-256 against the app manifest
         run: node scripts/download-shenava-model.mjs --check
 
+      - name: Prove the Release mirror serves byte-identical files (build-time fallback)
+        if: env.PUBLISH_RELEASE == 'true'
+        env:
+          TAG: ${{ env.RELEASE_TAG }}
+        run: |
+          set -euo pipefail
+          MIRROR="https://github.com/${{ github.repository }}/releases/download/$TAG"
+          # Deliberately point the installer at the mirror only: no Hugging Face, headers are not
+          # needed for a non-browser client, and every byte is still verified against size + SHA-256.
+          SHENAVA_MODEL_MIRROR="$MIRROR" \
+          SHENAVA_MODEL_DIR=mirror-check \
+          SHENAVA_MODEL_CACHE_DIR=mirror-cache \
+          HF_ENDPOINT='http://127.0.0.1:1' \
+            node scripts/download-shenava-model.mjs --report=mirror-report.json --strict
+          {
+            echo '### دانلود از mirror (بدون Hugging Face)'
+            echo '```json'
+            cat mirror-report.json
+            echo '```'
+          } > mirror-verify.txt
+          cat mirror-verify.txt
+          {
+            echo '### Release mirror download (Hugging Face disabled)'
+            echo '```json'
+            cat mirror-report.json
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
       - name: Show the downloaded files
         run: |
           ls -l public/models/shenava
