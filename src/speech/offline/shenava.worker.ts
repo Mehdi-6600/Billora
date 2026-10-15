@@ -16,7 +16,13 @@ import * as ort from 'onnxruntime-web/wasm'
 import { computeLogMel } from './features'
 import { readMetadataInt, readOnnxMetadata, type OnnxMetadata } from './onnxMetadata'
 import { greedyDecodeNemo, type NemoTransducerRuntime } from './rnnt'
-import { SHENAVA_CACHE_NAME, SHENAVA_MODEL_FILES, type ShenavaModelFile } from './shenavaModel'
+import {
+  currentBaseHref,
+  resolveShenavaWorkerUrls,
+  SHENAVA_CACHE_NAME,
+  SHENAVA_MODEL_FILES,
+  type ShenavaModelFile,
+} from './shenavaModel'
 import { decodeTokens, parseTokens, type TokenTable } from './tokenizer'
 import type { ShenavaEngineInfo, ShenavaMetrics, ShenavaWorkerRequest, ShenavaWorkerResponse } from './shenavaProtocol'
 
@@ -25,7 +31,7 @@ declare const self: {
   postMessage: (message: ShenavaWorkerResponse) => void
   close: () => void
   crossOriginIsolated?: boolean
-  location?: { origin?: string }
+  location?: { origin?: string; href?: string }
   navigator?: { hardwareConcurrency?: number }
 }
 
@@ -340,19 +346,20 @@ function numberFromMetadata(metadata: OnnxMetadata, key: string, fallback: numbe
 async function initialise(request: Extract<ShenavaWorkerRequest, { type: 'init' }>): Promise<ShenavaEngineInfo> {
   ort.env.logLevel = 'error'
   ort.env.wasm.numThreads = request.threads
+
+  // URL building lives in `shenavaModel.ts` so it is unit tested; it resolves everything against an
+  // ABSOLUTE base (a relative base such as `/models/shenava/` is rejected by browsers and used to
+  // break the engine before it fetched anything).
+  const urls = resolveShenavaWorkerUrls({
+    baseUrl: request.baseUrl ?? '/',
+    baseHref: request.baseHref ?? currentBaseHref(self) ?? currentBaseHref(),
+    modelBaseUrl: request.modelBaseUrl,
+    remoteModelUrls: request.remoteModelUrls,
+  })
   // The runtime files are copied into `<base>ort/` by the Vite plugin in `vite.config.ts`, so the
   // engine never falls back to a CDN (which would break offline use and cross-origin isolation).
-  const origin = typeof self.location?.origin === 'string' ? self.location.origin : 'http://localhost'
-  ort.env.wasm.wasmPaths = new URL('ort/', new URL(request.baseUrl ?? '/', origin)).href
-
-  const directory = request.modelBaseUrl ?? new URL('models/shenava/', request.baseUrl).href
-  const url = (name: string) => new URL(name, directory.endsWith('/') ? directory : `${directory}/`).href
-  const candidates = (name: string): ByteCandidate[] => {
-    const list: ByteCandidate[] = [{ url: url(name), source: 'network' }]
-    const remote = request.remoteModelUrls?.[name]
-    if (remote) list.push({ url: remote, source: 'hub' })
-    return list
-  }
+  ort.env.wasm.wasmPaths = urls.ortDirectoryUrl
+  const candidates = (name: string): ByteCandidate[] => urls.candidatesFor(name)
 
   const encoderFile = await loadBytes('encoder.int8.onnx', candidates('encoder.int8.onnx'), request.useCache)
   const decoderFile = await loadBytes('decoder.int8.onnx', candidates('decoder.int8.onnx'), request.useCache)

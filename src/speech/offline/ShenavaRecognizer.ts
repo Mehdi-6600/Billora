@@ -8,9 +8,11 @@
 
 import { OFFLINE_SPEECH_MESSAGES, describeMissingFiles } from './offlineSpeechMessages'
 import {
+  currentBaseHref,
   probeShenavaModel,
+  resolveAbsoluteUrl,
   shenavaHubUrl,
-  shenavaModelUrl,
+  shenavaModelDirectoryUrl,
   shenavaRuntimeSupported,
   SHENAVA_HUB_ENDPOINT,
   SHENAVA_MODEL_FILES,
@@ -43,6 +45,8 @@ export interface ShenavaTranscript {
 export interface ShenavaRecognizerOptions {
   /** Vite base URL (`import.meta.env.BASE_URL`); used to build same-origin model URLs. */
   baseUrl?: string
+  /** Absolute page URL used as the resolution base; defaults to `location.href`. */
+  baseHref?: string
   /** Absolute directory that holds the model files; overrides `baseUrl` when provided. */
   modelBaseUrl?: string
   createWorker?: () => Worker
@@ -105,8 +109,8 @@ export class ShenavaRecognizer {
     return this.metrics
   }
 
-  /** `local` when the app serves the files, `hub` when they must be downloaded once. */
-  get modelSource(): 'local' | 'hub' | null {
+  /** `local` when the app serves the files, `hub`/`mixed` when part of them comes from the Hub. */
+  get modelSource(): 'local' | 'hub' | 'mixed' | null {
     return this.availability?.source ?? null
   }
 
@@ -193,6 +197,7 @@ export class ShenavaRecognizer {
       const request: ShenavaWorkerRequest = {
         type: 'init',
         baseUrl: this.options.baseUrl ?? '/',
+        baseHref: this.baseHref() ?? undefined,
         modelBaseUrl: this.options.modelBaseUrl ?? this.modelDirectoryUrl(),
         remoteModelUrls: this.remoteModelUrls(),
         useCache: this.options.useCache ?? true,
@@ -202,10 +207,14 @@ export class ShenavaRecognizer {
     })
   }
 
+  /** Absolute (when possible) directory URL of the model files, for the worker to fetch. */
   private modelDirectoryUrl(): string {
-    const base = this.options.baseUrl ?? '/'
-    const encoded = shenavaModelUrl('tokens.txt', base)
-    return encoded.slice(0, encoded.lastIndexOf('/') + 1)
+    const directory = shenavaModelDirectoryUrl(this.options.baseUrl ?? '/')
+    return resolveAbsoluteUrl(directory, this.baseHref()) ?? directory
+  }
+
+  private baseHref(): string | null {
+    return this.options.baseHref ?? currentBaseHref()
   }
 
   private handleMessage(message: ShenavaWorkerResponse): void {

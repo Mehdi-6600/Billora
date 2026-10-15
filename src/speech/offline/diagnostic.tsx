@@ -33,7 +33,7 @@ function DiagnosticPage() {
   const [cancelRequested, setCancelRequested] = useState(false)
   const [seconds, setSeconds] = useState(0)
   const [log, setLog] = useState<string[]>([])
-  const [modelSource, setModelSource] = useState<'local' | 'hub' | null>(null)
+  const [modelSource, setModelSource] = useState<'local' | 'hub' | 'mixed' | null>(null)
 
   const recognizerRef = useRef<ShenavaRecognizer | null>(null)
   const captureRef = useRef<MicCapture | null>(null)
@@ -170,7 +170,7 @@ function DiagnosticPage() {
         <h2>۱) وضعیت مدل و محیط</h2>
         <MetricRow label="مسیر مدل" value={shenavaModelUrl('encoder.int8.onnx', import.meta.env.BASE_URL)} />
         <MetricRow label="موجود بودن مدل" value={availability === null ? 'در حال بررسی…' : availability.available ? 'موجود' : `ناقص (${availability.missing.join(', ') || 'نامشخص'})`} />
-        <MetricRow label="منبع مدل" value={modelSource === 'hub' ? 'نصب‌نشده؛ دانلود یک‌بار از Hugging Face' : modelSource === 'local' ? 'کنار خود برنامه' : '—'} />
+        <MetricRow label="منبع مدل" value={modelSource === 'local' ? 'کنار خود برنامه' : modelSource === 'hub' ? 'نصب‌نشده؛ دانلود یک‌بار از Hugging Face' : modelSource === 'mixed' ? 'بخشی همراه برنامه، بقیه یک‌بار از Hugging Face' : '—'} />
         <MetricRow label="Cross-Origin Isolated" value={isolated ? 'بله (چندرشته‌ای)' : 'خیر (تک‌رشته‌ای و کندتر)'} />
         <MetricRow label="hardwareConcurrency" value={String(navigator.hardwareConcurrency ?? 0)} />
         <MetricRow label="threads مورد استفادهٔ ORT" value={info ? String(info.threads) : '—'} />
@@ -182,9 +182,8 @@ function DiagnosticPage() {
             <code> public/models/shenava/</code> قرار می‌گیرند و در گیت ذخیره نمی‌شوند.
           </p>
         )}
-        {modelSource === 'hub' && (
-          <p className="hint">{OFFLINE_SPEECH_MESSAGES.remoteModelDownload}</p>
-        )}
+        {modelSource === 'hub' && <p className="hint">{OFFLINE_SPEECH_MESSAGES.remoteModelDownload}</p>}
+        {modelSource === 'mixed' && <p className="hint">{OFFLINE_SPEECH_MESSAGES.remoteModelPartial}</p>}
       </section>
 
       <section className="card">

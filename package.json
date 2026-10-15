@@ -8,10 +8,12 @@
     "build": "tsc -b && vite build",
     "preview": "vite preview --host 0.0.0.0",
     "typecheck": "tsc --noEmit",
-    "test": "vitest run",
+    "test": "vitest run && npm run test:scripts",
     "test:watch": "vitest",
     "model:download": "node scripts/download-shenava-model.mjs",
-    "model:check": "node scripts/download-shenava-model.mjs --check"
+    "model:check": "node scripts/download-shenava-model.mjs --check",
+    "prebuild": "node scripts/download-shenava-model.mjs",
+    "test:scripts": "node --test scripts/download-shenava-model.test.mjs"
   },
   "dependencies": {
     "lucide-react": "^1.57.0",

@@ -106,6 +106,19 @@ describe('useOfflineSpeech: چرخهٔ کامل موتور آفلاین', () => 
     expect(latest!.message).toContain('آفلاین')
   })
 
+  it('اگر بخشی از مدل روی دامنه نباشد (منبع mixed)، پیام دانلود بخشی را می‌دهد', async () => {
+    renderHook({
+      onTranscript: vi.fn(),
+      createRecognizer: () => fakeRecognizer() as unknown as ShenavaRecognizer,
+      probe: async () => ({ available: true, missing: [], source: 'mixed' }),
+    })
+    await flush()
+    expect(latest!.status).toBe('ready')
+    expect(latest!.modelSource).toBe('mixed')
+    expect(latest!.message).toContain('بخشی از مدل')
+    expect(latest!.canStart).toBe(true)
+  })
+
   it('اگر مدل نصب نباشد، پیام «از ورودی متنی استفاده کنید» می‌دهد و شروع نمی‌کند', async () => {
     const recognizer = fakeRecognizer()
     renderHook({
