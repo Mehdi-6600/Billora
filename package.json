@@ -9,10 +9,13 @@
     "preview": "vite preview --host 0.0.0.0",
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
-    "test:watch": "vitest"
+    "test:watch": "vitest",
+    "model:download": "node scripts/download-shenava-model.mjs",
+    "model:check": "node scripts/download-shenava-model.mjs --check"
   },
   "dependencies": {
     "lucide-react": "^1.57.0",
+    "onnxruntime-web": "^1.30.0",
     "react": "^19.3.0",
     "react-dom": "^19.3.0"
   },

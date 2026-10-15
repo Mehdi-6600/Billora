@@ -17,3 +17,12 @@ coverage/
 .idea/
 .vscode/
 *.swp
+
+# Offline speech model (Shenava Koochik v1.5 RNNT int8, ~137 MB) — fetched with `npm run model:download`
+public/models/shenava/*.onnx
+public/models/shenava/*.data
+public/models/shenava/*.part
+public/models/shenava/.download-cache.json
+
+# ONNX Runtime Web runtime files, copied from node_modules by the Vite plugin
+public/ort/

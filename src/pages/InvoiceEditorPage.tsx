@@ -18,7 +18,11 @@ import {
 import { calculateInvoiceTotals, calculateLineAmounts, formatNumber, formatToman, parseLocalizedNumber } from '../domain/calculations'
 import { normalizeProductName, parseCommand, supportedCommandExamples, type ParsedCommand } from '../domain/commands'
 import { planCommand, productConfirmation, type ProductCommandAction } from '../domain/command-execution'
-import { PersianSpeechSession, type SpeechStatus } from '../domain/speech-recognition'
+import { PersianSpeechSession, getSpeechRecognitionConstructor, type SpeechStatus } from '../domain/speech-recognition'
+import { resolveActiveEngine, detectIosLike, type SpeechEnginePreference } from '../speech/offline/engineSelection'
+import { OFFLINE_SPEECH_MESSAGES } from '../speech/offline/offlineSpeechMessages'
+import { itnForCommand } from '../speech/offline/persianItn'
+import { useOfflineSpeech, type OfflineSpeechOptions } from '../speech/offline/useOfflineSpeech'
 import type { InvoiceForm, InvoiceLineForm } from '../domain/invoice-form'
 import type { Product, ProductDraft } from '../domain/types'
 import { createId } from '../utils'
@@ -63,6 +67,7 @@ export function InvoiceEditorPage({
   onUpdateProduct,
   onDeleteProduct,
   onNotify,
+  offlineSpeech,
 }: {
   form: InvoiceForm
   products: Product[]
@@ -75,6 +80,8 @@ export function InvoiceEditorPage({
   onUpdateProduct: (product: ProductDraft) => Promise<void>
   onDeleteProduct: (product: Product) => Promise<void>
   onNotify: (message: string, tone?: 'success' | 'error' | 'info') => void
+  /** Injection seam for the on-device engine (tests and the standalone diagnostic page). */
+  offlineSpeech?: Partial<OfflineSpeechOptions>
 }) {
   const [commandText, setCommandText] = useState('')
   const [commandMessage, setCommandMessage] = useState('')
@@ -82,14 +89,33 @@ export function InvoiceEditorPage({
   const [targetPrompt, setTargetPrompt] = useState<TargetPrompt | null>(null)
   const [targetId, setTargetId] = useState('')
   const [speechStatus, setSpeechStatus] = useState<SpeechStatus>('idle')
+  const [webSpeechServiceUnavailable, setWebSpeechServiceUnavailable] = useState(false)
+  const [enginePreference, setEnginePreference] = useState<SpeechEnginePreference>('auto')
   const [busy, setBusy] = useState(false)
   const [formError, setFormError] = useState('')
   const recognitionRef = useRef<PersianSpeechSession | null>(null)
 
+  // The on-device Shenava engine. It only ever produces a transcript string, exactly like the
+  // Web Speech session above, so the Persian command pipeline below is untouched.
+  const offline = useOfflineSpeech({
+    ...offlineSpeech,
+    baseUrl: offlineSpeech?.baseUrl ?? import.meta.env.BASE_URL,
+    onTranscript: (transcript) => {
+      offlineSpeech?.onTranscript?.(transcript)
+      setCommandText(transcript)
+      setCommandMessage(OFFLINE_SPEECH_MESSAGES.done)
+    },
+    transformTranscript: offlineSpeech?.transformTranscript ?? ((transcript) => itnForCommand(transcript, parseCommand)),
+  })
+
   useEffect(() => {
     const session = new PersianSpeechSession(window, {
       onStatusChange: setSpeechStatus,
-      onMessage: setCommandMessage,
+      onMessage: (message) => {
+        // A missing Persian speech service is the one Web Speech failure that the offline engine fixes.
+        if (message.includes('service-not-allowed')) setWebSpeechServiceUnavailable(true)
+        setCommandMessage(message)
+      },
       onTranscript: (transcript) => setCommandText(transcript),
     })
     recognitionRef.current = session
@@ -263,6 +289,70 @@ export function InvoiceEditorPage({
               ? 'تلاش دوباره'
               : 'گفتار'
 
+  const offlineAvailable = offline.available === true
+  const offlineBusy = offline.status === 'preparing' || offline.status === 'listening' || offline.status === 'transcribing'
+  const offlineFailed = offline.status === 'error' || offline.status === 'unavailable' || offline.status === 'unsupported' || offline.status === 'checking'
+  const activeEngine = resolveActiveEngine({
+    userAgent: typeof navigator === 'undefined' ? '' : navigator.userAgent,
+    platform: typeof navigator === 'undefined' ? '' : (navigator.platform ?? ''),
+    maxTouchPoints: typeof navigator === 'undefined' ? 0 : (navigator.maxTouchPoints ?? 0),
+    webSpeechAvailable: Boolean(getSpeechRecognitionConstructor(window)),
+    webSpeechServiceUnavailable,
+    offlineAvailable,
+    preference: enginePreference,
+  })
+  const offlineActive = activeEngine === 'offline'
+  const offlineButtonLabel = offline.status === 'listening'
+    ? 'توقف ضبط موتور آفلاین'
+    : offline.status === 'preparing'
+      ? 'در حال آماده‌سازی موتور آفلاین روی دستگاه'
+      : offline.status === 'transcribing'
+        ? 'در حال تبدیل گفتار به متن روی دستگاه'
+        : offline.status === 'result'
+          ? 'شروع دوبارهٔ تشخیص گفتار آفلاین'
+          : offlineAvailable
+            ? 'گفتن دستور با میکروفن آفلاین'
+            : 'موتور تشخیص گفتار آفلاین در دسترس نیست؛ متن را دستی وارد کنید'
+  const offlineButtonText = offline.status === 'listening'
+    ? 'توقف'
+    : offline.status === 'preparing'
+      ? 'آماده‌سازی…'
+      : offline.status === 'transcribing'
+        ? 'تبدیل…'
+        : offline.status === 'result'
+          ? 'دوباره'
+          : offline.status === 'error'
+            ? 'تلاش دوباره'
+            : 'آفلاین'
+  const micButtonLabel = offlineActive ? offlineButtonLabel : voiceButtonLabel
+  const micButtonText = offlineActive ? offlineButtonText : voiceButtonText
+  const micButtonBusy = offlineActive ? offlineBusy : speechBusy
+  const micButtonListening = offlineActive ? offline.status === 'listening' : speechStatus === 'listening'
+  const micButtonError = offlineActive ? offlineFailed : speechError
+  const micButtonComplete = offlineActive ? offline.status === 'result' : speechStatus === 'result'
+  const micButtonDisabled = offlineActive && !offlineAvailable
+  const handleMicClick = offlineActive
+    ? (offlineBusy ? offline.stop : offline.start)
+    : (speechBusy ? () => recognitionRef.current?.stop() : startListening)
+  // Users who cannot use Web Speech Persian (iOS Safari, or a service-not-allowed error) get the
+  // explicit "engine unavailable" hint demanded by the offline-engine contract.
+  const offlineHintNeeded = !offlineAvailable && offline.status !== 'checking' && (
+    enginePreference === 'offline'
+    || webSpeechServiceUnavailable
+    || !getSpeechRecognitionConstructor(window)
+    || detectIosLike({
+      userAgent: typeof navigator === 'undefined' ? '' : navigator.userAgent,
+      platform: typeof navigator === 'undefined' ? '' : (navigator.platform ?? ''),
+      maxTouchPoints: typeof navigator === 'undefined' ? 0 : (navigator.maxTouchPoints ?? 0),
+    })
+  )
+  // Progress and failures of the on-device engine have to be visible, otherwise a failed start
+  // looks like a dead button (the first load can take minutes on a phone).
+  const offlineNoteVisible = Boolean(offline.message) && (
+    offlineHintNeeded
+    || (offlineActive && (offline.status === 'error' || offline.status === 'preparing' || offline.status === 'transcribing'))
+  )
+
   return (
     <div className="page-stack invoice-editor-page">
       <div className="editor-back-row"><button type="button" className="back-link" onClick={onBack}><ArrowRight size={17} /> بازگشت به فاکتورها</button><span className={`editor-local-label${hasSaved ? ' saved' : ' unsaved'}`}><span />{hasSaved ? 'ذخیره‌شده روی دستگاه' : 'ذخیره نشده'}</span></div>
@@ -344,10 +434,16 @@ export function InvoiceEditorPage({
         <div className="command-heading"><span className="command-heading-icon"><Sparkles size={18} /></span><div><span className="panel-kicker">پردازش محلی · بدون API هوش مصنوعی</span><h2>دستور متنی فارسی</h2><p>برای فاکتور یا فهرست محصولات، یکی از دستورهای مشخص را بنویسید.</p></div></div>
         <div className="command-input-row">
           <input value={commandText} onChange={(event) => { setCommandText(event.target.value); setCommandMessage('') }} onKeyDown={(event) => { if (event.key === 'Enter' && !event.shiftKey) { event.preventDefault(); runCommand() } }} placeholder="مثلاً: سه عدد شیر به فاکتور اضافه کن" aria-label="نوشتن دستور فارسی" />
-          <button type="button" className={`voice-button${speechStatus === 'listening' ? ' listening' : ''}${speechError ? ' speech-error' : ''}${speechStatus === 'result' ? ' speech-complete' : ''}`} onClick={speechBusy ? () => recognitionRef.current?.stop() : startListening} aria-label={voiceButtonLabel} title="تشخیص گفتار مرورگر؛ آفلاین تضمین نمی‌شود">{speechBusy ? <MicOff size={17} /> : speechStatus === 'result' ? <Check size={17} /> : <Mic size={17} />}<span>{voiceButtonText}</span></button>
+          <button type="button" className={`voice-button${offlineActive ? ' offline-voice-button' : ''}${micButtonListening ? ' listening' : ''}${micButtonError ? ' speech-error' : ''}${micButtonComplete ? ' speech-complete' : ''}`} onClick={handleMicClick} disabled={micButtonDisabled} aria-label={micButtonLabel} title={offlineActive ? 'تشخیص گفتار روی دستگاه؛ صدا از این دستگاه خارج نمی‌شود' : 'تشخیص گفتار مرورگر؛ آفلاین تضمین نمی‌شود'}>{micButtonBusy ? <MicOff size={17} /> : micButtonComplete ? <Check size={17} /> : <Mic size={17} />}<span>{micButtonText}</span></button>
+          {offlineActive && Boolean(getSpeechRecognitionConstructor(window)) && <button type="button" className="engine-toggle" aria-label="استفاده از تشخیص گفتار مرورگر" title="تشخیص گفتار مرورگر؛ ممکن است به اینترنت نیاز داشته باشد" onClick={() => { setEnginePreference('browser'); offline.cancel() }}><Mic size={15} /><span>مرورگر</span></button>}
+          {!offlineActive && offlineAvailable && <button type="button" className="engine-toggle" aria-label="تشخیص گفتار آفلاین روی دستگاه" title="تشخیص گفتار آفلاین شنوا؛ صدا از این دستگاه خارج نمی‌شود" onClick={() => { setEnginePreference('offline'); offline.start() }}><Sparkles size={15} /><span>آفلاین</span></button>}
+          {!offlineActive && !offlineAvailable && offlineHintNeeded && <button type="button" className="engine-toggle" disabled aria-label="موتور تشخیص گفتار آفلاین در دسترس نیست؛ متن را دستی وارد کنید" title="موتور تشخیص گفتار آفلاین در دسترس نیست؛ متن را دستی وارد کنید"><Sparkles size={15} /><span>آفلاین</span></button>}
           <button type="button" className="button button-primary command-run" onClick={runCommand}>اجرای دستور</button>
         </div>
-        <p className="voice-disclaimer">تشخیص گفتار فقط به Web Speech API مرورگر وابسته است؛ پشتیبانی فارسی و کارکرد آفلاین تضمین نمی‌شود و ممکن است به اینترنت یا مجوز میکروفن نیاز داشته باشد. بعضی مرورگرها صدا را برای پردازش به سرویس گفتار خود می‌فرستند. متن شنیده‌شده خودکار اجرا نمی‌شود.</p>
+        {offlineNoteVisible && <div className="offline-engine-note" aria-live="polite"><CircleHelp size={14} />{offline.message || OFFLINE_SPEECH_MESSAGES.modelMissing}</div>}
+        <p className="voice-disclaimer">{offlineActive
+          ? 'موتور آفلاین «شنوا کوچیک» صدا را کامل روی همین دستگاه پردازش می‌کند و به اینترنت نیازی ندارد. متن شنیده‌شده خودکار اجرا نمی‌شود و پیش از اجرا قابل ویرایش است.'
+          : 'تشخیص گفتار فقط به Web Speech API مرورگر وابسته است؛ پشتیبانی فارسی و کارکرد آفلاین تضمین نمی‌شود و ممکن است به اینترنت یا مجوز میکروفن نیاز داشته باشد. بعضی مرورگرها صدا را برای پردازش به سرویس گفتار خود می‌فرستند. متن شنیده‌شده خودکار اجرا نمی‌شود.'}</p>
         {commandMessage && <div className="command-feedback" role="status"><CircleHelp size={16} />{commandMessage}</div>}
         <div className="command-examples"><span>نمونه‌ها:</span>{supportedCommandExamples.map((example) => <button type="button" key={example} onClick={() => { setCommandText(example); setCommandMessage('') }}>{example}</button>)}</div>
 

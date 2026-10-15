@@ -1,14 +1,51 @@
+import { copyFile, mkdir } from 'node:fs/promises'
 import { env } from 'node:process'
-import { defineConfig } from 'vite'
+import { fileURLToPath } from 'node:url'
+import { join } from 'node:path'
+import { defineConfig, type Plugin } from 'vite'
 import react from '@vitejs/plugin-react'
 import { VitePWA } from 'vite-plugin-pwa'
 
 const base = env.GITHUB_PAGES === 'true' ? '/Billora/' : '/'
 const assetUrl = (name: string) => `${base}${name}`
 
+/**
+ * The offline speech engine runs ONNX Runtime Web with SharedArrayBuffer, which browsers only expose
+ * to cross-origin isolated pages. Production sets these headers in `vercel.json`; the dev server
+ * (and `vite preview`) need their own copy so `crossOriginIsolated === true` while developing.
+ * GitHub Pages cannot send headers, so the engine degrades to a single thread there.
+ */
+/**
+ * ONNX Runtime Web ships its WASM runtime outside the package's `exports` map, so it cannot be
+ * imported with `?url`. Copying the two files the engine needs into `public/ort/` keeps every
+ * request same-origin, which both cross-origin isolation and offline use require.
+ */
+function ortRuntimePlugin(): Plugin {
+  const files = ['ort-wasm-simd-threaded.wasm', 'ort-wasm-simd-threaded.mjs']
+  const from = fileURLToPath(new URL('./node_modules/onnxruntime-web/dist/', import.meta.url))
+  const to = fileURLToPath(new URL('./public/ort/', import.meta.url))
+  const copy = async () => {
+    await mkdir(to, { recursive: true })
+    for (const file of files) await copyFile(join(from, file), join(to, file))
+  }
+  return {
+    name: 'billora-ort-runtime',
+    async buildStart() { await copy() },
+    async configureServer() { await copy() },
+    async configurePreviewServer() { await copy() },
+  }
+}
+
+const crossOriginIsolationHeaders = {
+  'Cross-Origin-Opener-Policy': 'same-origin',
+  'Cross-Origin-Embedder-Policy': 'require-corp',
+  'Cross-Origin-Resource-Policy': 'same-origin',
+}
+
 export default defineConfig({
   base,
   plugins: [
+    ortRuntimePlugin(),
     react(),
     VitePWA({
       registerType: 'autoUpdate',
@@ -44,12 +81,18 @@ export default defineConfig({
       devOptions: { enabled: false },
     }),
   ],
+  // ONNX Runtime Web must be kept out of the dev-time dependency pre-bundling, otherwise the WASM
+  // loader and the `?url` assets it needs end up in two different module instances.
+  optimizeDeps: { exclude: ['onnxruntime-web'] },
+  worker: { format: 'es' },
   server: {
     host: '0.0.0.0',
     allowedHosts: true,
+    headers: crossOriginIsolationHeaders,
   },
   preview: {
     host: '0.0.0.0',
     allowedHosts: true,
+    headers: crossOriginIsolationHeaders,
   },
 })
