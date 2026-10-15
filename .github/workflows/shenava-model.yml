@@ -1,0 +1,324 @@
+name: Shenava model — verify, mirror, report
+
+# One manual workflow that answers every "is the model really usable?" question with facts, on a
+# machine that has internet access (a GitHub runner):
+#
+#   1. downloads the four files exactly like the Vercel build step does (`prebuild`), with a JSON
+#      report (bytes, milliseconds, SHA-256, endpoint) and `--strict` so any problem fails the job,
+#   2. re-checks them with `--check` (size + SHA-256 must match the app manifest),
+#   3. builds the app and shows that the files land in `dist/models/shenava/`,
+#   4. optionally attaches them to a GitHub Release, which then acts as a public model mirror for
+#      hosts that cannot serve the 131 MB encoder themselves,
+#   5. measures the release asset's real HTTP headers — including `access-control-allow-origin` and
+#      `cross-origin-resource-policy`, which decide whether a browser on a cross-origin isolated page
+#      (COEP: require-corp) is allowed to fetch it,
+#   6. optionally runs `scripts/verify-deployed-model.mjs` against a live deployment URL,
+#   7. posts the whole report as a comment, so the evidence is readable outside the Actions UI.
+#
+# Run: Actions → Shenava model — verify, mirror, report → Run workflow
+#      gh workflow run shenava-model.yml -f publish_release=true -f verify_deployed_url=https://…
+
+on:
+  workflow_dispatch:
+    inputs:
+      publish_release:
+        description: 'مدل را به یک GitHub Release پیوست کن (mirror عمومی)'
+        type: boolean
+        default: true
+      release_tag:
+        description: 'برچسب Release برای mirror مدل'
+        type: string
+        default: 'shenava-model-v1.5-int8'
+      verify_deployed_url:
+        description: 'آدرس استقرار برای بررسی واقعی (اختیاری، مثلاً https://billora.vercel.app)'
+        type: string
+        default: ''
+      report_issue:
+        description: 'شمارهٔ Issue برای ثبت گزارش (اختیاری)'
+        type: string
+        default: '8'
+
+permissions:
+  contents: write
+  issues: write
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    env:
+      REPORT: model-report.json
+      # `github.event.inputs` is empty for push runs, so the defaults are spelled out here and both
+      # triggers (manual dispatch and the temporary branch trigger) behave identically.
+      PUBLISH_RELEASE: ${{ github.event.inputs.publish_release || 'true' }}
+      RELEASE_TAG: ${{ github.event.inputs.release_tag || 'shenava-model-v1.5-int8' }}
+      VERIFY_URL: ${{ github.event.inputs.verify_deployed_url || '' }}
+      REPORT_ISSUE: ${{ github.event.inputs.report_issue || '8' }}
+      # اختیاری: اگر این Secret در مخزن باشد، مدل در Vercel Blob آپلود می‌شود و آدرس پایهٔ
+      # عمومی + هدرهای واقعی‌اش اندازه‌گیری و گزارش می‌شود (میزبان جایگزین انکودر ۱۳۱ مگابایتی).
+      BLOB_TOKEN: ${{ secrets.BLOB_READ_WRITE_TOKEN }}
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Download the model (same script the build runs)
+        run: node scripts/download-shenava-model.mjs --strict --report="$REPORT"
+
+      - name: Verify sizes and SHA-256 against the app manifest
+        run: node scripts/download-shenava-model.mjs --check
+
+      - name: Prove the Release mirror serves byte-identical files (build-time fallback)
+        if: env.PUBLISH_RELEASE == 'true'
+        env:
+          TAG: ${{ env.RELEASE_TAG }}
+        run: |
+          set -euo pipefail
+          MIRROR="https://github.com/${{ github.repository }}/releases/download/$TAG"
+          # Deliberately point the installer at the mirror only: no Hugging Face, headers are not
+          # needed for a non-browser client, and every byte is still verified against size + SHA-256.
+          SHENAVA_MODEL_MIRROR="$MIRROR" \
+          SHENAVA_MODEL_DIR=mirror-check \
+          SHENAVA_MODEL_CACHE_DIR=mirror-cache \
+          HF_ENDPOINT='http://127.0.0.1:1' \
+            node scripts/download-shenava-model.mjs --report=mirror-report.json --strict
+          {
+            echo '### دانلود از mirror (بدون Hugging Face)'
+            echo '```json'
+            cat mirror-report.json
+            echo '```'
+          } > mirror-verify.txt
+          cat mirror-verify.txt
+          {
+            echo '### Release mirror download (Hugging Face disabled)'
+            echo '```json'
+            cat mirror-report.json
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Show the downloaded files
+        run: |
+          ls -l public/models/shenava
+          echo '--- sha256 ---'
+          sha256sum public/models/shenava/*
+
+      - name: Build and confirm the model is inside dist
+        run: |
+          npm run build
+          ls -l dist/models/shenava
+
+      - name: Confirm nothing in the build output exceeds the host's per-file limit
+        run: |
+          set -euo pipefail
+          {
+            echo '### فایل‌های مدل در build (هیچ فایلی نباید از ۱۰۰ مگابایت بزرگ‌تر باشد)'
+            echo '```'
+            ls -lS dist/models/shenava || echo '(no model in dist for this build)'
+            echo
+            if find dist -type f -size +100M | grep -q .; then
+              echo 'FAIL: بیش از ۱۰۰ مگابایت — استقرار ورسل رد می‌شود'
+              find dist -type f -size +100M
+              echo '```'
+              exit 1
+            fi
+            echo 'بزرگ‌ترین فایل منتشرشده زیر ۱۰۰ مگابایت است ✅'
+            echo '--- model-parts.json ---'
+            cat dist/models/shenava/model-parts.json 2>/dev/null || echo 'این build فایل تقسیم‌شده ندارد'
+            echo '```'
+          } > dist-size-check.txt
+          cat dist-size-check.txt
+
+      - name: Publish the model as a release mirror
+        if: env.PUBLISH_RELEASE == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ env.RELEASE_TAG }}
+        run: |
+          set -euo pipefail
+          gh release view "$TAG" >/dev/null 2>&1 || gh release create "$TAG" \
+            --title "Shenava Koochik v1.5 RNNT int8 (mirror)" \
+            --notes "Mirror of the model files from https://huggingface.co/Reza2kn/Shenava-Koochik-v1.5-RNNT-sherpa-onnx used by Billora's offline speech engine. Downloaded and SHA-256 verified by CI; not part of the git repository."
+          gh release upload "$TAG" public/models/shenava/* --clobber
+
+      - name: Measure the mirror's HTTP headers (browser CORS requirements)
+        if: env.PUBLISH_RELEASE == 'true'
+        env:
+          TAG: ${{ env.RELEASE_TAG }}
+        run: |
+          set -euo pipefail
+          URL="https://github.com/${{ github.repository }}/releases/download/$TAG/encoder.int8.onnx"
+          echo "asset: $URL" | tee mirror-headers.txt
+          # The 302 goes to a signed URL; `-L` follows it, which is exactly what a browser does.
+          curl -sSL -o /dev/null -D - -H 'Origin: https://billora.example' -H 'Range: bytes=0-0' "$URL" \
+            | grep -iE '^(HTTP/|content-type|content-length|content-range|access-control-allow-origin|access-control-expose-headers|cross-origin-resource-policy|vary)' \
+            | tee -a mirror-headers.txt || true
+          {
+            echo '### Release asset headers (encoder.int8.onnx)'
+            echo '```'
+            cat mirror-headers.txt
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Measure the Hugging Face CORS headers (the built-in fallback host)
+        run: |
+          set -euo pipefail
+          URL="https://huggingface.co/Reza2kn/Shenava-Koochik-v1.5-RNNT-sherpa-onnx/resolve/main/encoder.int8.onnx"
+          FILTER='^(HTTP/|access-control|content-type|content-range|content-length|cross-origin|location)'
+          {
+            echo "url: $URL"
+            echo "--- plain GET with Origin (what the worker does when it downloads) ---"
+            curl -sS -L -o /dev/null -D - -H 'Origin: https://billora.example' "$URL" | grep -iE "$FILTER"
+            echo "--- HEAD with Origin (what the model probe does first) ---"
+            curl -sS -L -o /dev/null -D - -I -H 'Origin: https://billora.example' "$URL" | grep -iE "$FILTER"
+          } > hf-headers.txt 2>&1 || true
+          cat hf-headers.txt
+          {
+            echo '### Hugging Face resolve headers'
+            echo '```'
+            cat hf-headers.txt
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      # میزبان جایگزین (اولویت کاربر): Vercel Blob. بدون Secret، گام بی‌صدا رد می‌شود.
+      - name: Upload the model to Vercel Blob (optional — needs the BLOB_READ_WRITE_TOKEN secret)
+        if: env.BLOB_TOKEN != ''
+        continue-on-error: true
+        env:
+          BLOB_READ_WRITE_TOKEN: ${{ env.BLOB_TOKEN }}
+        run: |
+          set -uo pipefail
+          node scripts/upload-shenava-model.mjs --dir=public/models/shenava --prefix=shenava-model \
+            --report=blob-report.json --quiet || true
+          BASE=$(node -e "try{const r=require('./blob-report.json'); if(r.baseUrl) console.log(r.baseUrl)}catch(e){}")
+          ENC=$(node -e "try{const r=require('./blob-report.json'); const f=r.files.find(x=>x.name==='encoder.int8.onnx'); if(f) console.log(f.url)}catch(e){}")
+          if [ -n "$ENC" ]; then
+            {
+              echo "baseUrl: $BASE"
+              echo "--- encoder headers (GET with Origin, first byte) ---"
+              curl -sS -m 60 -o /dev/null -D - -r 0-0 -H "Origin: https://billora.example" "$ENC" \
+                | grep -iE '^(HTTP/|content-type|content-length|content-range|access-control|cross-origin|location)' || true
+            } > blob-headers.txt
+            cat blob-headers.txt
+            echo
+            echo "این را در Vercel به‌عنوان Environment Variable بگذارید:"
+            echo "VITE_SHENAVA_MODEL_BASE_URL=$BASE"
+          fi
+          {
+            echo '### آپلود در Vercel Blob (میزبان جایگزین)'
+            echo '```json'
+            cat blob-report.json 2>/dev/null || echo '{}'
+            echo '```'
+            if [ -f blob-headers.txt ]; then
+              echo
+              echo '```'
+              cat blob-headers.txt
+              echo '```'
+            fi
+          } > blob-verify.txt
+          cat blob-verify.txt
+
+      # Read-only proof about what the live site actually answers. This settles Q1 with real HTTP
+      # responses instead of guesses: the deployment domains sit behind Vercel Authentication, so an
+      # anonymous request can never return the model file — the exact response says why.
+      - name: Probe the live deployment over HTTP (read-only)
+        continue-on-error: true
+        env:
+          LIVE_URL: https://billora-ai-image-app.vercel.app
+        run: |
+          set -uo pipefail
+          {
+            echo "base: $LIVE_URL"
+            for path in / /test-shenava.html /models/shenava/encoder.int8.onnx /models/shenava/tokens.txt; do
+              echo
+              echo "=== GET $path ==="
+              curl -sS -m 60 -o /tmp/body -D - "$LIVE_URL$path" \
+                | sed -E 's/(set-cookie:).*/\1 <omitted>/I' \
+                | grep -iE '^(HTTP/|content-type|content-length|location|cross-origin|access-control|x-vercel|www-authenticate|server|set-cookie)' || true
+              echo "--- first 300 bytes of the body ---"
+              head -c 300 /tmp/body | tr -d '\000' | sed -e 's/[[:space:]]\+/ /g'
+              echo
+            done
+          } > live-probe.txt 2>&1
+          cat live-probe.txt
+
+      - name: Check the live deployment (optional)
+        if: env.VERIFY_URL != ''
+        continue-on-error: true
+        env:
+          TARGET: ${{ env.VERIFY_URL }}
+        run: |
+          set -euo pipefail
+          node scripts/verify-deployed-model.mjs "$TARGET" | tee deployed-report.txt
+          echo '### Deployed check' >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          cat deployed-report.txt >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Compose the report
+        if: always()
+        run: |
+          {
+            echo "## گزارش بررسی مدل — \`${{ github.sha }}\`"
+            echo
+            echo "منبع دانلود: \`https://huggingface.co\` (پیش‌فرض) · ماشین: GitHub runner"
+            echo
+            echo 'اگر انکودر از سقف میزبان بزرگ‌تر باشد، همین build آن را به تکه‌های ۶۴ مگابایتی تقسیم می‌کند؛ ستون `split` در شمارش‌های زیر تعداد فایل‌های تقسیم‌شده است.'
+            echo
+            echo '```json'
+            cat "$REPORT" 2>/dev/null || echo '{}'
+            echo '```'
+            echo
+            echo '```'
+            ls -l public/models/shenava 2>/dev/null || true
+            sha256sum public/models/shenava/* 2>/dev/null || true
+            echo '--- dist ---'
+            ls -l dist/models/shenava 2>/dev/null || echo 'dist/models/shenava empty'
+            echo '```'
+            if [ -f hf-headers.txt ]; then
+              echo
+              echo '### هدرهای Hugging Face (منبع پشتیبان پیش‌فرض موتور)'
+              echo '```'
+              cat hf-headers.txt
+              echo '```'
+            fi
+            if [ -f mirror-verify.txt ]; then
+              echo
+              cat mirror-verify.txt
+            fi
+            if [ -f dist-size-check.txt ]; then
+              echo
+              cat dist-size-check.txt
+            fi
+            if [ -f blob-verify.txt ]; then
+              echo
+              cat blob-verify.txt
+            fi
+            if [ -f live-probe.txt ]; then
+              echo
+              echo '### پاسخ واقعی دامنهٔ Production (read-only، از ماشین runner)'
+              echo '```'
+              cat live-probe.txt
+              echo '```'
+            fi
+            if [ -f mirror-headers.txt ]; then
+              echo
+              echo '### هدرهای asset روی GitHub Release (فعال‌بودن fetch مرورگر)'
+              echo '```'
+              cat mirror-headers.txt
+              echo '```'
+            fi
+          } > report.md
+          cat report.md
+
+      - name: Post the report
+        if: always() && env.REPORT_ISSUE != ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh issue comment "$REPORT_ISSUE" --body-file report.md

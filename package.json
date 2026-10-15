@@ -13,7 +13,9 @@
     "model:download": "node scripts/download-shenava-model.mjs",
     "model:check": "node scripts/download-shenava-model.mjs --check",
     "prebuild": "node scripts/download-shenava-model.mjs",
-    "test:scripts": "node --test scripts/download-shenava-model.test.mjs"
+    "test:scripts": "node --test scripts/*.test.mjs",
+    "verify:deployed": "node scripts/verify-deployed-model.mjs",
+    "upload:model": "node scripts/upload-shenava-model.mjs"
   },
   "dependencies": {
     "lucide-react": "^1.57.0",
@@ -25,6 +27,7 @@
     "@types/node": "^22.20.5",
     "@types/react": "^19.2.0",
     "@types/react-dom": "^19.2.0",
+    "@vercel/blob": "^2.8.2",
     "@vitejs/plugin-react": "^6.1.2",
     "fake-indexeddb": "^6.2.5",
     "jsdom": "^27.0.0",

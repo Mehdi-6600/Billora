@@ -10,12 +10,14 @@ import { OFFLINE_SPEECH_MESSAGES, describeMissingFiles } from './offlineSpeechMe
 import {
   currentBaseHref,
   probeShenavaModel,
+  probeShenavaModelFiles,
   resolveAbsoluteUrl,
-  shenavaHubUrl,
   shenavaModelDirectoryUrl,
+  shenavaRemoteFileUrl,
   shenavaRuntimeSupported,
-  SHENAVA_HUB_ENDPOINT,
+  configuredRemoteBaseUrl,
   SHENAVA_MODEL_FILES,
+  type ShenavaDetailedAvailability,
   type ShenavaModelAvailability,
 } from './shenavaModel'
 import {
@@ -58,6 +60,11 @@ export interface ShenavaRecognizerOptions {
   allowRemoteModel?: boolean
   /** Overrides `https://huggingface.co` (mirrors, private staging). */
   hubEndpoint?: string
+  /**
+   * Directory holding the remote copies (GitHub Release, Vercel Blob, R2, …). Defaults to
+   * `VITE_SHENAVA_MODEL_BASE_URL`, then to Hugging Face.
+   */
+  remoteBaseUrl?: string | null
   useCache?: boolean
   /** Thread count handed to ONNX Runtime Web; forced to 1 without cross-origin isolation. */
   threads?: number
@@ -133,19 +140,44 @@ export class ShenavaRecognizer {
       this.options.baseUrl ?? '/',
       undefined,
       this.isSupported(),
-      { allowRemote: this.allowRemoteModel(), hubEndpoint: this.options.hubEndpoint },
+      this.probeOptions(),
     )
+  }
+
+  /** Same probe, but with per-file status/size — what the diagnostic page displays. */
+  probeFiles(): Promise<ShenavaDetailedAvailability> {
+    const fetcher = this.options.fetcher
+    return probeShenavaModelFiles(
+      fetcher ?? (globalThis.fetch as unknown as Parameters<typeof probeShenavaModelFiles>[0]),
+      this.options.baseUrl ?? '/',
+      undefined,
+      this.isSupported(),
+      this.probeOptions(),
+    )
+  }
+
+  private probeOptions(): { allowRemote: boolean; hubEndpoint?: string; remoteBaseUrl?: string | null } {
+    return {
+      allowRemote: this.allowRemoteModel(),
+      hubEndpoint: this.options.hubEndpoint,
+      remoteBaseUrl: this.options.remoteBaseUrl ?? configuredRemoteBaseUrl(),
+    }
+  }
+
+  /** Directory that holds the remote copies; `null` means Hugging Face. */
+  get remoteBaseUrl(): string | null {
+    return this.options.remoteBaseUrl ?? configuredRemoteBaseUrl()
   }
 
   private allowRemoteModel(): boolean {
     return this.options.allowRemoteModel ?? true
   }
 
-  /** File name → upstream URL, handed to the worker so it can fall back when a file is absent. */
+  /** File name → remote URL, handed to the worker so it can fall back when a file is absent. */
   private remoteModelUrls(): Record<string, string> | undefined {
     if (!this.allowRemoteModel()) return undefined
-    const endpoint = this.options.hubEndpoint ?? SHENAVA_HUB_ENDPOINT
-    return Object.fromEntries(SHENAVA_MODEL_FILES.map((file) => [file.name, shenavaHubUrl(file.name, endpoint)]))
+    const options = { hubEndpoint: this.options.hubEndpoint, remoteBaseUrl: this.options.remoteBaseUrl ?? configuredRemoteBaseUrl() }
+    return Object.fromEntries(SHENAVA_MODEL_FILES.map((file) => [file.name, shenavaRemoteFileUrl(file.name, options)]))
   }
 
   async init(): Promise<ShenavaEngineInfo> {

@@ -10,12 +10,86 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { createRoot } from 'react-dom/client'
 import { createMicCapture, type MicCapture } from './audioCapture'
+import { detectIosLike, resolveActiveEngine, type SpeechEnvironment } from './engineSelection'
 import { OFFLINE_SPEECH_MESSAGES } from './offlineSpeechMessages'
 import { ShenavaRecognizer } from './ShenavaRecognizer'
-import { shenavaModelUrl, type ShenavaModelAvailability } from './shenavaModel'
+import {
+  configuredRemoteBaseUrl,
+  shenavaModelUrl,
+  SHENAVA_REMOTE_BASE_ENV,
+  type ShenavaDetailedAvailability,
+  type ShenavaFileReport,
+} from './shenavaModel'
 import type { ShenavaEngineInfo, ShenavaMetrics } from './shenavaProtocol'
 
 const ACCEPTED_SENTENCE = 'سلام حال شما خوبه'
+
+function formatBytes(bytes: number | null): string {
+  if (bytes === null || !Number.isFinite(bytes)) return '—'
+  if (bytes >= 1_048_576) return `${(bytes / 1_048_576).toFixed(1)} MB`
+  if (bytes >= 1024) return `${(bytes / 1024).toFixed(1)} KB`
+  return `${bytes} B`
+}
+
+const STATE_LABELS: Record<string, string> = {
+  ok: 'موجود',
+  absent: 'غایب',
+  unreachable: 'دسترس‌ناپذیر',
+  'not-checked': 'بررسی نشده',
+}
+
+function FileTable({ files }: { files: ShenavaFileReport[] }) {
+  return (
+    <table className="files">
+      <thead>
+        <tr>
+          <th>فایل</th>
+          <th>حجم مورد انتظار</th>
+          <th>روی همین دامنه</th>
+          <th>روی میزبان بیرونی</th>
+          <th>وضعیت نهایی</th>
+          <th>تکه‌ها</th>
+        </tr>
+      </thead>
+      <tbody>
+        {files.map((file) => {
+          const usable = file.local === 'ok' || file.remote === 'ok'
+          return (
+            <tr key={file.name}>
+              <td dir="ltr">{file.name}</td>
+              <td>{formatBytes(file.expectedBytes)}</td>
+              <td>{STATE_LABELS[file.local] ?? file.local} ({formatBytes(file.localBytes)})</td>
+              <td>
+                {file.remote === 'not-checked'
+                  ? '—'
+                  : `${STATE_LABELS[file.remote] ?? file.remote} (${formatBytes(file.remoteBytes)})`}
+              </td>
+              <td>{usable ? '✅ قابل استفاده' : '❌ ناموجود'}</td>
+              <td>
+                {file.parts ? (
+                  <>
+                    {`${file.parts} تکه (جمع ${formatBytes(file.expectedBytes)})`}
+                    {file.partsState && file.partsState !== 'ok'
+                      ? ` — مشکل: ${STATE_LABELS[file.partsState] ?? file.partsState}`
+                      : ''}
+                    {file.partsUrl ? (
+                      <>
+                        {' '}
+                        <code dir="ltr">{file.partsUrl.split('/').pop()}</code>
+                      </>
+                    ) : null}
+                  </>
+                ) : (
+                  '—'
+                )}
+              </td>
+            </tr>
+          )
+        })}
+      </tbody>
+    </table>
+  )
+}
 
 function MetricRow({ label, value }: { label: string; value: string }) {
   return (
@@ -24,7 +98,7 @@ function MetricRow({ label, value }: { label: string; value: string }) {
 }
 
 function DiagnosticPage() {
-  const [availability, setAvailability] = useState<ShenavaModelAvailability | null>(null)
+  const [availability, setAvailability] = useState<ShenavaDetailedAvailability | null>(null)
   const [status, setStatus] = useState('idle')
   const [message, setMessage] = useState('')
   const [info, setInfo] = useState<ShenavaEngineInfo | null>(null)
@@ -55,7 +129,7 @@ function DiagnosticPage() {
   useEffect(() => {
     const isolated = typeof globalThis.crossOriginIsolated === 'boolean' ? globalThis.crossOriginIsolated : false
     if (!isolated) console.error('[Shenava] Cross-origin isolation missing. WASM will run on 1 thread.')
-    void engine().probe().then((result) => {
+    void engine().probeFiles().then((result) => {
       setAvailability(result)
       setModelSource(result.source ?? null)
       appendLog(result.available ? 'مدل روی همین دامنه پیدا شد.' : `مدل ناقص است: ${result.missing.join(', ')}`)
@@ -68,7 +142,7 @@ function DiagnosticPage() {
   }, [appendLog, engine])
 
   const checkModel = async () => {
-    const result = await engine().probe()
+    const result = await engine().probeFiles()
     setAvailability(result)
     setModelSource(result.source ?? null)
     appendLog(result.available ? 'بررسی مدل: موجود' : `بررسی مدل: ناقص (${result.missing.join(', ')})`)
@@ -155,6 +229,32 @@ function DiagnosticPage() {
 
   const isolated = typeof globalThis.crossOriginIsolated === 'boolean' ? globalThis.crossOriginIsolated : false
   const listening = recognizerRef.current !== null && captureRef.current !== null
+  const webSpeechSupported = typeof window !== 'undefined'
+    && Boolean(window.SpeechRecognition ?? window.webkitSpeechRecognition)
+  const environment: SpeechEnvironment = {
+    userAgent: typeof navigator === 'undefined' ? '' : navigator.userAgent,
+    platform: typeof navigator === 'undefined' ? '' : (navigator.platform ?? ''),
+    maxTouchPoints: typeof navigator === 'undefined' ? 0 : (navigator.maxTouchPoints ?? 0),
+    webSpeechAvailable: webSpeechSupported,
+    webSpeechServiceUnavailable: false,
+    offlineAvailable: availability?.available ?? false,
+    preference: 'auto',
+  }
+  const chosenEngine = resolveActiveEngine(environment)
+  const engineDecision = {
+    label: !availability?.available
+      ? 'فقط ورودی متنی و Web Speech API (موتور آفلاین در دسترس نیست)'
+      : chosenEngine === 'offline'
+        ? 'تشخیص گفتار آفلاین روی دستگاه (شنوا)'
+        : 'موتور گفتار مرورگر (Web Speech API)',
+    reason: !availability?.available
+      ? 'مدل نصب نیست یا فایل‌ها خوانده نمی‌شوند'
+      : chosenEngine === 'offline'
+        ? (detectIosLike(environment)
+            ? 'دستگاه iOS است؛ سرویس فارسی Web Speech در آن وجود ندارد'
+            : 'گزینهٔ آفلاین به‌صورت دستی انتخاب شده است')
+        : 'این مرورگر Web Speech دارد؛ گزینهٔ آفلاین با کلید «آفلاین» قابل انتخاب است',
+  }
 
   return (
     <div className="wrap">
@@ -167,12 +267,43 @@ function DiagnosticPage() {
       </header>
 
       <section className="card">
-        <h2>۱) وضعیت مدل و محیط</h2>
+        <h2>۱) وضعیت موتور و مدل</h2>
+        <MetricRow label="موتور فعال در فرم فاکتور" value={engineDecision.label} />
+        <MetricRow label="دلیل انتخاب" value={engineDecision.reason} />
+        <MetricRow label="Web Speech API در این مرورگر" value={webSpeechSupported ? 'در دسترس' : 'در دسترس نیست'} />
+        <MetricRow label="مدل آفلاین" value={availability === null ? 'در حال بررسی…' : availability.available ? 'قابل استفاده' : 'قابل استفاده نیست'} />
+        <MetricRow label="منبع مدل" value={availability?.source === 'local' ? 'کنار خود برنامه' : availability?.source === 'hub' ? 'دانلود یک‌بار از میزبان بیرونی' : availability?.source === 'mixed' ? 'بخشی همراه برنامه، بقیه از میزبان بیرونی' : '—'} />
+        <MetricRow label="میزبان بیرونی مدل" value={configuredRemoteBaseUrl() ?? 'Hugging Face (پیش‌فرض)'} />
+        {availability !== null && <div className="table-wrap"><FileTable files={availability.files} /></div>}
+        {availability !== null && !availability.available && (
+          <p className="hint">فایل‌های ناموجود: {availability.missing.join('، ') || 'نامشخص'}</p>
+        )}
+        <h3>محیط اجرا</h3>
         <MetricRow label="مسیر مدل" value={shenavaModelUrl('encoder.int8.onnx', import.meta.env.BASE_URL)} />
         <MetricRow label="موجود بودن مدل" value={availability === null ? 'در حال بررسی…' : availability.available ? 'موجود' : `ناقص (${availability.missing.join(', ') || 'نامشخص'})`} />
-        <MetricRow label="منبع مدل" value={modelSource === 'local' ? 'کنار خود برنامه' : modelSource === 'hub' ? 'نصب‌نشده؛ دانلود یک‌بار از Hugging Face' : modelSource === 'mixed' ? 'بخشی همراه برنامه، بقیه یک‌بار از Hugging Face' : '—'} />
+        <MetricRow label="منبع مدل" value={modelSource === 'local' ? 'کنار خود برنامه (تکه‌ها هم همین‌جا)' : modelSource === 'hub' ? 'نصب‌نشده؛ دانلود یک‌بار از Hugging Face' : modelSource === 'mixed' ? 'بخشی همراه برنامه، بقیه یک‌بار از Hugging Face' : '—'} />
+        <MetricRow
+          label="فایل تقسیم‌شده"
+          value={
+            availability === null
+              ? '—'
+              : availability.files.some((file) => file.parts)
+                ? availability.files
+                    .filter((file) => file.parts)
+                    .map((file) => `${file.name}: ${file.parts} تکه`)
+                    .join(' · ')
+                : 'ندارد (همهٔ فایل‌ها یکجا سرو می‌شوند)'
+          }
+        />
         <MetricRow label="Cross-Origin Isolated" value={isolated ? 'بله (چندرشته‌ای)' : 'خیر (تک‌رشته‌ای و کندتر)'} />
         <MetricRow label="hardwareConcurrency" value={String(navigator.hardwareConcurrency ?? 0)} />
+        <MetricRow label="iOS-like" value={detectIosLike(environment) ? 'بله' : 'خیر'} />
+        {configuredRemoteBaseUrl() === null && (
+          <p className="hint">
+            برای استفاده از میزبان دیگر (GitHub Release، Vercel Blob، R2 و …) مقدار
+            <code> {SHENAVA_REMOTE_BASE_ENV}</code> را در زمان build تنظیم کنید.
+          </p>
+        )}
         <MetricRow label="threads مورد استفادهٔ ORT" value={info ? String(info.threads) : '—'} />
         <MetricRow label="blankId / vocab" value={info ? `${info.blankId} / ${info.vocabSize}` : '—'} />
         <MetricRow label="منبع فایل‌ها" value={info ? Object.entries(info.sources).map(([file, source]) => `${file}=${source}`).join('، ') : '—'} />

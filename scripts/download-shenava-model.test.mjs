@@ -16,12 +16,18 @@ import { after, before, describe, it } from 'node:test'
 import {
   DEFAULT_CACHE_DIR,
   DEFAULT_TARGET_DIR,
+  MODEL_PARTS_FILE,
+  buildPartsManifest,
   describeLocalFile,
   endpointsFromEnv,
+  mirrorFileUrl,
+  mirrorsFromEnv,
   formatBytes,
   main,
   modelFileUrl,
   parseArgs,
+  planParts,
+  readPartsManifest,
   resolveConfiguration,
   runDownload,
 } from './download-shenava-model.mjs'
@@ -113,6 +119,18 @@ describe('نصب‌کنندهٔ مدل شنوا — توابع کمکی', () => 
     assert.equal(options.dir, '/tmp/x')
     assert.deepEqual(options.endpoints, ['https://a.test'])
     assert.throws(() => parseArgs(['--nope']), /unknown argument/)
+  })
+
+  it('آدرس mirror با ساختار flat ساخته می‌شود', () => {
+    assert.equal(
+      mirrorFileUrl('encoder.int8.onnx', 'https://github.com/o/r/releases/download/shenava-model-v1.5-int8/'),
+      'https://github.com/o/r/releases/download/shenava-model-v1.5-int8/encoder.int8.onnx',
+    )
+    assert.deepEqual(mirrorsFromEnv({}), [])
+    assert.deepEqual(mirrorsFromEnv({ SHENAVA_MODEL_MIRROR: 'https://a.test/x/, https://b.test/y' }), [
+      'https://a.test/x',
+      'https://b.test/y',
+    ])
   })
 
   it('میزبان‌ها را از HF_ENDPOINT می‌خواند', () => {
@@ -355,6 +373,58 @@ describe('نصب‌کنندهٔ مدل شنوا — دانلود و کش', () =>
     assert.equal(working.state.requests.length, 1)
   })
 
+  it('وقتی میزبان‌های Hugging Face کار نکنند، از mirror دانلود می‌کند', async () => {
+    const fixture = await makeFixture({ files: 2 })
+    const mirror = await startServer(fixture.payloads)
+    const dead = await startServer(new Map())
+    cleanups.push(
+      () => mirror.close(),
+      () => dead.close(),
+      () => rm(fixture.root, { recursive: true, force: true }),
+    )
+    const logger = collectLogger()
+
+    const summary = await runDownload({
+      targetDir: join(fixture.root, 'out'),
+      files: fixture.manifest,
+      endpoints: [dead.endpoint],
+      mirrors: [mirror.endpoint],
+      logger,
+      sleep: async () => {},
+      attempts: 1,
+    })
+
+    assert.equal(summary.downloaded, 2)
+    assert.equal(summary.failed, 0)
+    assert.ok(summary.report.every((entry) => entry.source === 'mirror'))
+    assert.ok(summary.report.every((entry) => entry.endpoint === mirror.endpoint))
+    for (const spec of fixture.manifest) {
+      assert.equal(sha256(await readFile(join(fixture.root, 'out', spec.name))), spec.sha256)
+    }
+  })
+
+  it('mirror خراب (هش ناهمخوان) پذیرفته نمی‌شود', async () => {
+    const fixture = await makeFixture({ files: 1 })
+    const [spec] = fixture.manifest
+    // همان نام فایل، محتوای غلط: باید رد شود و build از آن استفاده نکند
+    const badMirror = await startServer(new Map([[spec.name, Buffer.alloc(spec.bytes, 99)]]))
+    cleanups.push(() => badMirror.close(), () => rm(fixture.root, { recursive: true, force: true }))
+
+    const summary = await runDownload({
+      targetDir: join(fixture.root, 'out'),
+      files: fixture.manifest,
+      endpoints: [],
+      mirrors: [badMirror.endpoint],
+      logger: silentLogger,
+      sleep: async () => {},
+      attempts: 1,
+    })
+
+    assert.equal(summary.failed, 1)
+    assert.equal(summary.downloaded, 0)
+    assert.match(summary.errors[0], /SHA-256 mismatch/)
+  })
+
   it('شکست کامل دانلود، استثنا نمی‌دهد و فایل نیمه‌کاره باقی نمی‌گذارد', async () => {
     const fixture = await makeFixture({ files: 2 })
     const dead = await startServer(new Map())
@@ -467,6 +537,62 @@ describe('نصب‌کنندهٔ مدل شنوا — خط فرمان (npm run bui
     assert.ok(logger.lines.some((line) => line.includes('GitHub Pages')))
   })
 
+  it('گزارش JSON با حجم، زمان و SHA-256 هر فایل می‌نویسد', async () => {
+    const fixture = await makeFixture({ files: 2 })
+    const server = await startServer(fixture.payloads)
+    cleanups.push(() => server.close(), () => rm(fixture.root, { recursive: true, force: true }))
+    const reportPath = join(fixture.root, 'report.json')
+
+    const code = await main({
+      argv: [`--report=${reportPath}`],
+      env: {
+        SHENAVA_MODEL_DIR: join(fixture.root, 'installed'),
+        SHENAVA_MODEL_CACHE_DIR: join(fixture.root, 'cache'),
+        SHENAVA_MODEL_MANIFEST: fixture.manifestPath,
+        HF_ENDPOINT: server.endpoint,
+      },
+      logger: silentLogger,
+    })
+
+    assert.equal(code, 0)
+    const report = JSON.parse(await readFile(reportPath, 'utf8'))
+    assert.equal(report.files.length, 2)
+    assert.equal(report.counts.downloaded, 2)
+    assert.equal(report.endpoints[0], server.endpoint)
+    for (const file of report.files) {
+      assert.equal(file.status, 'downloaded')
+      assert.equal(file.bytes, 1024)
+      assert.equal(typeof file.ms, 'number')
+      assert.match(file.sha256, /^[0-9a-f]{64}$/)
+      assert.equal(file.endpoint, server.endpoint)
+    }
+    assert.deepEqual(report.errors, [])
+  })
+
+  it('گزارش، فایل‌های از قبل موجود را با زمان صفر ثبت می‌کند', async () => {
+    const fixture = await makeFixture({ files: 1 })
+    const targetDir = join(fixture.root, 'installed')
+    await mkdir(targetDir, { recursive: true })
+    await writeFile(join(targetDir, fixture.manifest[0].name), fixture.payloads.get(fixture.manifest[0].name))
+    cleanups.push(() => rm(fixture.root, { recursive: true, force: true }))
+    const reportPath = join(fixture.root, 'report.json')
+
+    await main({
+      argv: [`--report=${reportPath}`],
+      env: {
+        SHENAVA_MODEL_DIR: targetDir,
+        SHENAVA_MODEL_MANIFEST: fixture.manifestPath,
+        HF_ENDPOINT: 'http://127.0.0.1:1',
+      },
+      logger: silentLogger,
+    })
+
+    const report = JSON.parse(await readFile(reportPath, 'utf8'))
+    assert.equal(report.counts.skipped, 1)
+    assert.equal(report.files[0].status, 'skipped')
+    assert.equal(report.files[0].ms, 0)
+  })
+
   it('از یک سرور محلی (شبیه‌ساز میزبان) کامل نصب می‌کند', async () => {
     const fixture = await makeFixture({ files: 2 })
     const server = await startServer(fixture.payloads)
@@ -505,5 +631,208 @@ describe('نصب‌کنندهٔ مدل شنوا — سازگاری با برنا
       )
       if (file.sha256) assert.ok(appSource.includes(file.sha256), `هش ${file.name} با اپ هم‌خوان نیست`)
     }
+  })
+})
+
+describe('نصب‌کنندهٔ مدل شنوا — تقسیم فایل بزرگ (سقف میزبان)', () => {
+  const joined = (buffers) => Buffer.concat(buffers)
+
+  it('تکه‌ها قطعی و پشت‌سرهم ساخته می‌شوند', () => {
+    const parts = planParts('encoder.int8.onnx', 131_342_912, 64 * 1024 * 1024)
+    assert.deepEqual(
+      parts.map((part) => [part.name, part.bytes, part.offset]),
+      [
+        ['encoder.int8.onnx.part0', 67_108_864, 0],
+        ['encoder.int8.onnx.part1', 64_234_048, 67_108_864],
+      ],
+    )
+    // تکهٔ آخر کوچک‌تر است و جمع همه برابر حجم کل
+    assert.equal(parts.reduce((sum, part) => sum + part.bytes, 0), 131_342_912)
+    assert.deepEqual(planParts('x.onnx', 5, 100).map((part) => part.bytes), [5])
+    assert.throws(() => planParts('x.onnx', 0), /invalid size/)
+  })
+
+  it('فایل بالای سقف به تکه‌های هم‌مبدأ تقسیم می‌شود و فایل کامل کنار برنامه نمی‌ماند', async () => {
+    const fixture = await makeFixture({ files: 1, size: 10 })
+    const server = await startServer(fixture.payloads)
+    cleanups.push(
+      () => server.close(),
+      () => rm(fixture.root, { recursive: true, force: true }),
+    )
+    const targetDir = join(fixture.root, 'out')
+    const [spec] = fixture.manifest
+
+    const summary = await runDownload({
+      targetDir,
+      files: fixture.manifest,
+      endpoints: [server.endpoint],
+      maxBytes: 4,
+      chunkBytes: 4,
+      logger: silentLogger,
+      sleep: async () => {},
+      attempts: 1,
+    })
+
+    assert.equal(summary.split, 1)
+    assert.equal(summary.failed, 0)
+    assert.equal(summary.excluded, 0)
+    assert.equal(summary.report[0].status, 'split')
+    assert.equal(summary.report[0].parts, 3)
+
+    const entries = await readdir(targetDir)
+    assert.deepEqual(entries.sort(), [`${spec.name}.part0`, `${spec.name}.part1`, `${spec.name}.part2`, MODEL_PARTS_FILE])
+    // فایل کامل نباید کنار برنامه باشد، وگرنه استقرار به سقف میزبان می‌خورد
+    await assert.rejects(() => stat(join(targetDir, spec.name)), /ENOENT/)
+
+    const manifest = await readPartsManifest(targetDir)
+    assert.equal(manifest.version, 1)
+    assert.equal(manifest.chunkBytes, 4)
+    const entry = manifest.files[spec.name]
+    assert.equal(entry.bytes, spec.bytes)
+    assert.equal(entry.sha256, spec.sha256)
+    assert.deepEqual(entry.parts.map((part) => part.bytes), [4, 4, 2])
+
+    // چسباندن تکه‌ها باید بایت‌به‌بایت همان فایل اصلی باشد
+    const buffers = []
+    for (const part of entry.parts) {
+      const bytes = await readFile(join(targetDir, part.name))
+      assert.equal(sha256(bytes), part.sha256)
+      buffers.push(bytes)
+    }
+    assert.equal(sha256(joined(buffers)), spec.sha256)
+  })
+
+  it('--check تکه‌ها را بدون شبکه بررسی می‌کند و تکهٔ غایب را خطا می‌داند', async () => {
+    const fixture = await makeFixture({ files: 1, size: 9 })
+    const server = await startServer(fixture.payloads)
+    cleanups.push(
+      () => server.close(),
+      () => rm(fixture.root, { recursive: true, force: true }),
+    )
+    const targetDir = join(fixture.root, 'out')
+    const options = {
+      targetDir,
+      files: fixture.manifest,
+      endpoints: [server.endpoint],
+      maxBytes: 3,
+      chunkBytes: 3,
+      logger: silentLogger,
+      sleep: async () => {},
+      attempts: 1,
+    }
+    await runDownload(options)
+
+    const checked = await runDownload({ ...options, check: true, endpoints: ['http://127.0.0.1:1'] })
+    assert.equal(checked.failed, 0)
+    assert.equal(checked.split, 1)
+    assert.equal(checked.report[0].status, 'split')
+
+    const [spec] = fixture.manifest
+    await rm(join(targetDir, `${spec.name}.part1`))
+    const broken = await runDownload({ ...options, check: true, endpoints: ['http://127.0.0.1:1'] })
+    assert.equal(broken.failed, 1)
+    assert.match(broken.errors[0], /تکه‌های ناقص/)
+  })
+
+  it('با SHENAVA_MODEL_SPLIT=0 رفتار قبلی برمی‌گردد و manifest قدیمی پاک می‌شود', async () => {
+    const fixture = await makeFixture({ files: 1, size: 8 })
+    const server = await startServer(fixture.payloads)
+    cleanups.push(
+      () => server.close(),
+      () => rm(fixture.root, { recursive: true, force: true }),
+    )
+    const targetDir = join(fixture.root, 'out')
+    const options = {
+      targetDir,
+      files: fixture.manifest,
+      endpoints: [server.endpoint],
+      maxBytes: 2,
+      chunkBytes: 2,
+      logger: silentLogger,
+      sleep: async () => {},
+      attempts: 1,
+    }
+    await runDownload(options)
+    assert.ok(await readPartsManifest(targetDir))
+
+    const excluded = await runDownload({ ...options, split: false })
+    assert.equal(excluded.excluded, 1)
+    assert.equal(excluded.split, 0)
+    assert.equal(await readPartsManifest(targetDir), null)
+    const entries = await readdir(targetDir)
+    assert.deepEqual(entries.filter((name) => name.includes('.part')), [])
+  })
+
+  it('وقتی فایلی تقسیم نمی‌شود، manifest تازه نوشته نمی‌شود', async () => {
+    const fixture = await makeFixture({ files: 1, size: 6 })
+    const server = await startServer(fixture.payloads)
+    cleanups.push(
+      () => server.close(),
+      () => rm(fixture.root, { recursive: true, force: true }),
+    )
+    const targetDir = join(fixture.root, 'out')
+    const summary = await runDownload({
+      targetDir,
+      files: fixture.manifest,
+      endpoints: [server.endpoint],
+      maxBytes: 1024,
+      logger: silentLogger,
+      sleep: async () => {},
+      attempts: 1,
+    })
+    assert.equal(summary.split, 0)
+    assert.equal(summary.downloaded, 1)
+    assert.equal(summary.partsManifest, undefined)
+    assert.equal(await readPartsManifest(targetDir), null)
+    const [spec] = fixture.manifest
+    assert.equal((await stat(join(targetDir, spec.name))).size, spec.bytes)
+  })
+
+  it('buildPartsManifest شکل مورد انتظار مرورگر را می‌سازد', () => {
+    const manifest = buildPartsManifest(
+      [{ name: 'encoder.int8.onnx', bytes: 10, sha256: 'aa', parts: [{ name: 'encoder.int8.onnx.part0', bytes: 10, sha256: 'bb' }] }],
+      4,
+    )
+    assert.deepEqual(manifest, {
+      version: 1,
+      chunkBytes: 4,
+      files: { 'encoder.int8.onnx': { bytes: 10, sha256: 'aa', parts: [{ name: 'encoder.int8.onnx.part0', bytes: 10, sha256: 'bb' }] } },
+    })
+  })
+
+  it('فایل بالای سقف وقتی Hugging Face در دسترس نیست، از mirror دانلود و تقسیم می‌شود', async () => {
+    const fixture = await makeFixture({ files: 1, size: 10 })
+    const mirror = await startServer(fixture.payloads)
+    const dead = await startServer(new Map())
+    cleanups.push(
+      () => mirror.close(),
+      () => dead.close(),
+      () => rm(fixture.root, { recursive: true, force: true }),
+    )
+    const targetDir = join(fixture.root, 'out')
+    const cacheDir = join(fixture.root, 'cache')
+    const [spec] = fixture.manifest
+
+    // همان چیزی که در گردش‌کار CI اجرا می‌شود: Hugging Face خاموش، فقط mirror با ساختار flat
+    const summary = await runDownload({
+      targetDir,
+      cacheDir,
+      files: fixture.manifest,
+      endpoints: [dead.endpoint],
+      mirrors: [mirror.endpoint],
+      maxBytes: 4,
+      chunkBytes: 4,
+      logger: silentLogger,
+      sleep: async () => {},
+      attempts: 1,
+    })
+
+    assert.equal(summary.split, 1)
+    assert.equal(summary.failed, 0)
+    assert.ok(summary.errors.length === 0, JSON.stringify(summary.errors))
+    const entries = await readdir(targetDir)
+    assert.deepEqual(entries.sort(), [`${spec.name}.part0`, `${spec.name}.part1`, `${spec.name}.part2`, MODEL_PARTS_FILE])
+    // فایل کامل در کش می‌ماند تا build بعدی دوباره دانلود نکند
+    assert.equal(sha256(await readFile(join(cacheDir, spec.name))), spec.sha256)
   })
 })
