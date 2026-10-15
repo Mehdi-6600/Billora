@@ -121,19 +121,23 @@ jobs:
       - name: Confirm nothing in the build output exceeds the host's per-file limit
         run: |
           set -euo pipefail
-          echo '--- dist/model files, sorted by size ---'
-          ls -lS dist/models/shenava || echo '(no model in dist for this build)'
-          echo
-          echo '--- files larger than 100 MB (must be empty for Vercel Hobby) ---'
-          if find dist -type f -size +100M | grep -q .; then
-            echo 'FAIL: the deployment would be rejected'
-            find dist -type f -size +100M
-            exit 1
-          fi
-          echo 'none — every published file is below 100 MB'
-          echo
-          echo '--- chunks manifest ---'
-          cat dist/models/shenava/model-parts.json 2>/dev/null || echo 'no split file in this build'
+          {
+            echo '### فایل‌های مدل در build (هیچ فایلی نباید از ۱۰۰ مگابایت بزرگ‌تر باشد)'
+            echo '```'
+            ls -lS dist/models/shenava || echo '(no model in dist for this build)'
+            echo
+            if find dist -type f -size +100M | grep -q .; then
+              echo 'FAIL: بیش از ۱۰۰ مگابایت — استقرار ورسل رد می‌شود'
+              find dist -type f -size +100M
+              echo '```'
+              exit 1
+            fi
+            echo 'بزرگ‌ترین فایل منتشرشده زیر ۱۰۰ مگابایت است ✅'
+            echo '--- model-parts.json ---'
+            cat dist/models/shenava/model-parts.json 2>/dev/null || echo 'این build فایل تقسیم‌شده ندارد'
+            echo '```'
+          } > dist-size-check.txt
+          cat dist-size-check.txt
 
       - name: Publish the model as a release mirror
         if: env.PUBLISH_RELEASE == 'true'
@@ -291,6 +295,10 @@ jobs:
             if [ -f mirror-verify.txt ]; then
               echo
               cat mirror-verify.txt
+            fi
+            if [ -f dist-size-check.txt ]; then
+              echo
+              cat dist-size-check.txt
             fi
             if [ -f blob-verify.txt ]; then
               echo
