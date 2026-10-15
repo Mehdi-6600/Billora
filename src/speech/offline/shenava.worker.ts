@@ -14,10 +14,14 @@
 
 import * as ort from 'onnxruntime-web/wasm'
 import { computeLogMel } from './features'
+import { assembleModelParts } from './modelParts'
 import { readMetadataInt, readOnnxMetadata, type OnnxMetadata } from './onnxMetadata'
 import { greedyDecodeNemo, type NemoTransducerRuntime } from './rnnt'
 import {
   currentBaseHref,
+  SHENAVA_PARTS_FILE,
+  parsePartsManifest,
+  partsForFile,
   resolveShenavaWorkerUrls,
   SHENAVA_CACHE_NAME,
   SHENAVA_MODEL_FILES,
@@ -41,7 +45,8 @@ const MAX_AUDIO_SECONDS = 30
 type ModelOrigin = 'cache' | 'network' | 'hub'
 
 interface LoadedBytes {
-  bytes: Uint8Array
+  /** Plain (non-shared) buffer: `Response` bodies and ONNX Runtime both need `ArrayBuffer`. */
+  bytes: Uint8Array<ArrayBuffer>
   source: ModelOrigin
 }
 
@@ -100,7 +105,23 @@ async function openCache(): Promise<Cache | null> {
   }
 }
 
-async function loadBytes(fileName: string, candidates: readonly ByteCandidate[], useCache: boolean): Promise<LoadedBytes> {
+/**
+ * Fetches one URL and returns its bytes, with the same size/hash verification every source gets.
+ */
+async function fetchCandidate(candidate: ByteCandidate, file: ShenavaModelFile): Promise<LoadedBytes> {
+  const response = await fetch(candidate.url)
+  if (!response.ok) throw new Error(`HTTP ${response.status}`)
+  const bytes = new Uint8Array(await response.arrayBuffer())
+  await verifyModelBytes(bytes, file)
+  return { bytes, source: candidate.source === 'hub' ? 'hub' : 'network' }
+}
+
+async function loadBytes(
+  fileName: string,
+  candidates: readonly ByteCandidate[],
+  useCache: boolean,
+  parts: readonly { name: string; bytes: number }[] | null = null,
+): Promise<LoadedBytes> {
   const file = manifestFile(fileName)
   const cacheKey = candidates[0]!.url
   const cache = useCache ? await openCache() : null
@@ -115,26 +136,58 @@ async function loadBytes(fileName: string, candidates: readonly ByteCandidate[],
     }
   }
 
-  let lastError: Error | null = null
-  for (const candidate of candidates) {
+  const store = async (bytes: Uint8Array<ArrayBuffer>) => {
+    if (!cache) return
     try {
-      const response = await fetch(candidate.url)
-      if (!response.ok) throw new Error(`HTTP ${response.status}`)
-      const buffer = await response.arrayBuffer()
-      const bytes = new Uint8Array(buffer)
-      await verifyModelBytes(bytes, file)
-      if (cache) {
-        try {
-          await cache.put(cacheKey, new Response(bytes, { headers: { 'Content-Type': 'application/octet-stream' } }))
-        } catch {
-          // Quota or private-mode failures are not fatal: inference still works from this copy.
-        }
-      }
-      return { bytes, source: candidate.source === 'hub' ? 'hub' : 'network' }
+      await cache.put(cacheKey, new Response(bytes, { headers: { 'Content-Type': 'application/octet-stream' } }))
+    } catch {
+      // Quota or private-mode failures are not fatal: inference still works from this copy.
+    }
+  }
+
+  const local = candidates.filter((candidate) => candidate.source !== 'hub')
+  const remote = candidates.filter((candidate) => candidate.source === 'hub')
+  let lastError: Error | null = null
+
+  for (const candidate of local) {
+    try {
+      const loaded = await fetchCandidate(candidate, file)
+      await store(loaded.bytes)
+      return loaded
     } catch (error) {
       lastError = error instanceof Error ? error : new Error(String(error))
     }
   }
+
+  // Same-origin chunks come before any third-party host: they are the offline-safe route and they
+  // are what makes a split install work even where the upstream host is unreachable.
+  if (parts && parts.length > 0 && local.length > 0) {
+    try {
+      // `verify` is the very same size + SHA-256 check a single-file download gets.
+      const bytes = await assembleModelParts({
+        fileName: file.name,
+        bytes: file.bytes,
+        parts,
+        urlFor: (name) => local[0]!.url.replace(/[^/]*$/, name),
+        verify: (assembled) => verifyModelBytes(assembled, file),
+      })
+      await store(bytes)
+      return { bytes, source: 'network' }
+    } catch (error) {
+      lastError = error instanceof Error ? error : new Error(String(error))
+    }
+  }
+
+  for (const candidate of remote) {
+    try {
+      const loaded = await fetchCandidate(candidate, file)
+      await store(loaded.bytes)
+      return loaded
+    } catch (error) {
+      lastError = error instanceof Error ? error : new Error(String(error))
+    }
+  }
+
   throw new Error(`${fileName}: ${lastError?.message ?? 'could not be loaded'}`)
 }
 
@@ -343,6 +396,17 @@ function numberFromMetadata(metadata: OnnxMetadata, key: string, fallback: numbe
   return value !== null && value > 0 ? value : fallback
 }
 
+async function loadPartsManifest(urlFor: (fileName: string) => string) {
+  try {
+    const response = await fetch(urlFor(SHENAVA_PARTS_FILE))
+    if (!response.ok) return null
+    return parsePartsManifest(await response.json())
+  } catch {
+    // No manifest (or an unreachable one) simply means every file is a single static file.
+    return null
+  }
+}
+
 async function initialise(request: Extract<ShenavaWorkerRequest, { type: 'init' }>): Promise<ShenavaEngineInfo> {
   ort.env.logLevel = 'error'
   ort.env.wasm.numThreads = request.threads
@@ -361,9 +425,17 @@ async function initialise(request: Extract<ShenavaWorkerRequest, { type: 'init' 
   ort.env.wasm.wasmPaths = urls.ortDirectoryUrl
   const candidates = (name: string): ByteCandidate[] => urls.candidatesFor(name)
 
-  const encoderFile = await loadBytes('encoder.int8.onnx', candidates('encoder.int8.onnx'), request.useCache)
-  const decoderFile = await loadBytes('decoder.int8.onnx', candidates('decoder.int8.onnx'), request.useCache)
-  const joinerFile = await loadBytes('joiner.int8.onnx', candidates('joiner.int8.onnx'), request.useCache)
+  // Chunks are described by a tiny same-origin manifest that the build writes next to the model;
+  // without it (an ordinary build) every file is simply a single static file.
+  const partsManifest = await loadPartsManifest(urls.modelFileUrl)
+  const partsOf = (name: string): { name: string; bytes: number }[] | null => {
+    const file = manifestFile(name)
+    return partsForFile(partsManifest, name, file.bytes)
+  }
+
+  const encoderFile = await loadBytes('encoder.int8.onnx', candidates('encoder.int8.onnx'), request.useCache, partsOf('encoder.int8.onnx'))
+  const decoderFile = await loadBytes('decoder.int8.onnx', candidates('decoder.int8.onnx'), request.useCache, partsOf('decoder.int8.onnx'))
+  const joinerFile = await loadBytes('joiner.int8.onnx', candidates('joiner.int8.onnx'), request.useCache, partsOf('joiner.int8.onnx'))
   const tokens = await loadText('tokens.txt', candidates('tokens.txt'), request.useCache)
   tokenTable = parseTokens(tokens.text)
 

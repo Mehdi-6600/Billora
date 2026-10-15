@@ -32,6 +32,8 @@ export const MODEL_FILES = [
 
 export const MODEL_DIRECTORY = 'models/shenava'
 export const DIAGNOSTIC_PAGE = 'test-shenava.html'
+/** Manifest the build writes when a file had to be split to fit the host's per-file size limit. */
+export const PARTS_FILE = 'model-parts.json'
 const TIMEOUT_MS = 60_000
 
 export function formatBytes(bytes) {
@@ -152,6 +154,61 @@ export async function describeRemote(
   }
 }
 
+/**
+ * Reads `model-parts.json` from the deployment. A 404, an HTML SPA fallback or broken JSON means
+ * "this build ships whole files", which is not an error.
+ */
+export async function fetchPartsManifest(base, { fetchImpl = fetch, timeoutMs = TIMEOUT_MS } = {}) {
+  try {
+    const response = await fetchImpl(`${normalizeBaseUrl(base)}/${MODEL_DIRECTORY}/${PARTS_FILE}`, {
+      signal: AbortSignal.timeout(timeoutMs),
+    })
+    if (!response.ok) return null
+    const type = headerOf(response, 'content-type') ?? ''
+    if (type.includes('html')) return null
+    const body = await response.json()
+    if (!body || typeof body !== 'object' || typeof body.files !== 'object' || body.files === null) return null
+    return body
+  } catch {
+    return null
+  }
+}
+
+/** Checks every chunk of a split file: HTTP status, content type and the exact byte size. */
+async function verifyParts(base, file, manifest, { fetchImpl, timeoutMs }) {
+  const entry = manifest?.files?.[file.name]
+  if (!entry || !Array.isArray(entry.parts) || entry.parts.length === 0) return []
+  const total = entry.parts.reduce((sum, part) => sum + (Number(part.bytes) || 0), 0)
+  if (total !== file.bytes) {
+    return [
+      {
+        name: `${file.name}: manifest sums to ${total} bytes, ${file.bytes} expected`,
+        status: 0,
+        text: false,
+        passed: false,
+        url: `${normalizeBaseUrl(base)}/${MODEL_DIRECTORY}/${PARTS_FILE}`,
+        bytes: total,
+      },
+    ]
+  }
+  const checked = []
+  for (const part of entry.parts) {
+    const url = `${normalizeBaseUrl(base)}/${MODEL_DIRECTORY}/${part.name}`
+    const described = await describeRemote(url, { fetchImpl, timeoutMs, expectedBytes: part.bytes })
+    const servedAsHtml = (described.contentType ?? '').includes('html')
+    checked.push({
+      name: part.name,
+      status: described.status,
+      text: servedAsHtml,
+      bytes: described.contentLength,
+      expectedBytes: part.bytes,
+      passed: described.ok && described.matches === true && !servedAsHtml,
+      url,
+    })
+  }
+  return checked
+}
+
 export async function verifyDeployment({
   baseUrl,
   files = MODEL_FILES,
@@ -190,13 +247,21 @@ export async function verifyDeployment({
     results.failures.push(`${DIAGNOSTIC_PAGE} → HTTP ${diagnostic.status} (${diagnostic.contentType ?? 'no content-type'})`)
   }
 
-  // 3) every model file
+  // 3) the chunks manifest, when the build had to split a file (host size limit)
+  const manifest = await fetchPartsManifest(base, { fetchImpl, timeoutMs })
+  results.parts = manifest ? { present: true, files: Object.keys(manifest.files ?? {}) } : { present: false, files: [] }
+
+  // 4) every model file — served whole, or as the chunks the manifest describes
   for (const file of files) {
     const url = `${base}/${MODEL_DIRECTORY}/${file.name}`
     const described = await describeRemote(url, { fetchImpl, timeoutMs, expectedBytes: file.bytes })
     // The dev server answers missing files with `index.html` + HTTP 200, so a wrong size must fail.
     const servedAsHtml = (described.contentType ?? '').includes('html')
-    const passed = described.ok && described.matches === true && !servedAsHtml
+    const whole = described.ok && described.matches === true && !servedAsHtml
+    const parts = whole ? [] : await verifyParts(base, file, manifest, { fetchImpl, timeoutMs })
+
+    const partsOk = parts.length > 0 && parts.every((part) => part.passed)
+    const passed = whole || partsOk
     results.files.push({
       name: file.name,
       expectedBytes: file.bytes,
@@ -207,14 +272,20 @@ export async function verifyDeployment({
       matches: described.matches,
       passed,
       url,
+      servedAs: whole ? 'file' : partsOk ? 'parts' : 'missing',
+      parts,
     })
     if (!passed) {
       results.failures.push(
         `${file.name}: HTTP ${described.status}, content-type=${described.contentType ?? '—'}, ` +
-          `length=${described.contentLength ?? '—'} (expected ${file.bytes})`,
+          `length=${described.contentLength ?? '—'} (expected ${file.bytes})` +
+          (parts.length > 0 ? ` و تکه‌ها هم ناقص‌اند (${parts.filter((part) => !part.passed).map((part) => part.name).join(', ')})` : ''),
       )
     }
-    if (!results.quiet) logger.log(`  ${passed ? 'PASS' : 'FAIL'}  ${file.name} — ${formatBytes(described.contentLength)}`)
+    if (!results.quiet) {
+      const how = whole ? '' : partsOk ? `  ← ${parts.length} تکهٔ هم‌مبدأ` : ''
+      logger.log(`  ${passed ? 'PASS' : 'FAIL'}  ${file.name} — ${formatBytes(described.contentLength)}${how}`)
+    }
   }
 
   results.ok = results.failures.length === 0
@@ -228,6 +299,9 @@ function printReport(results, logger = console) {
   logger.log(
     `صفحهٔ تشخیص: HTTP ${results.diagnostic.status} · ${results.diagnostic.contentType ?? '—'}`,
   )
+  if (results.parts?.present) {
+    logger.log(`مانیفست تکه‌ها: موجود (${results.parts.files.join(', ') || '—'})`)
+  }
   logger.log('')
   logger.log('فایل                            وضعیت   Content-Type                 حجم گزارش‌شده   انتظار')
   logger.log('─'.repeat(96))
@@ -235,8 +309,13 @@ function printReport(results, logger = console) {
     logger.log(
       `${file.name.padEnd(30)} HTTP ${String(file.status).padEnd(4)} ${(file.contentType || '—').padEnd(28)} ` +
         `${formatBytes(file.contentLength).padEnd(14)} ${formatBytes(file.expectedBytes)}` +
-        `${file.matches ? '' : '  ← ناهمخوان'}`,
+        `${file.matches ? '' : '  ← ناهمخوان'}${file.servedAs === 'parts' ? '  ← تکه‌تکه سرو می‌شود' : ''}`,
     )
+    for (const part of file.parts ?? []) {
+      logger.log(
+        `  ${part.passed ? '✓' : '✗'} ${part.name} — HTTP ${part.status} · ${formatBytes(part.bytes)} از ${formatBytes(part.expectedBytes)}`,
+      )
+    }
   }
   logger.log('')
   if (results.ok) {

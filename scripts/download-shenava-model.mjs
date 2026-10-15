@@ -35,7 +35,7 @@
 
 import { createHash } from 'node:crypto'
 import { createReadStream, createWriteStream } from 'node:fs'
-import { copyFile, mkdir, readFile, rename, rm, stat, writeFile } from 'node:fs/promises'
+import { copyFile, mkdir, open, readdir, readFile, rename, rm, stat, writeFile } from 'node:fs/promises'
 import { isAbsolute, join, resolve } from 'node:path'
 import { Readable } from 'node:stream'
 import { pipeline } from 'node:stream/promises'
@@ -44,6 +44,18 @@ import { pathToFileURL } from 'node:url'
 export const MODEL_REPO = 'Reza2kn/Shenava-Koochik-v1.5-RNNT-sherpa-onnx'
 export const MODEL_REVISION = 'main'
 export const DEFAULT_ENDPOINT = 'https://huggingface.co'
+
+/**
+ * Hosts with a per-file size limit (Vercel Hobby: 100 MB for static uploads) would reject the
+ * 125 MiB encoder and fail the whole deployment. Instead of dropping that file — which forces every
+ * browser to fetch it from a third party — it is split into byte-identical chunks below the limit
+ * and the app reassembles it in memory (see `src/speech/offline/shenavaModel.ts`). The chunks are
+ * ordinary static files, so the model still comes from the app's own origin.
+ */
+export const DEFAULT_CHUNK_BYTES = 64 * 1024 * 1024
+export const DEFAULT_HOST_FILE_LIMIT = 100_000_000
+/** Name of the manifest that describes split files; served next to the model files. */
+export const MODEL_PARTS_FILE = 'model-parts.json'
 
 /**
  * Sizes and SHA-256 values come from the Hugging Face LFS metadata
@@ -92,6 +104,90 @@ export function modelFileUrl(fileName, { endpoint = DEFAULT_ENDPOINT, revision =
  */
 export function mirrorFileUrl(fileName, mirrorBase) {
   return `${mirrorBase.replace(/\/+$/, '')}/${fileName}`
+}
+
+/**
+ * Splits `totalBytes` into consecutive chunks. The result is deterministic: same input, same part
+ * names and sizes, which keeps the browser cache and the deployment verifier stable.
+ */
+export function planParts(fileName, totalBytes, chunkBytes = DEFAULT_CHUNK_BYTES) {
+  if (!Number.isFinite(totalBytes) || totalBytes <= 0) throw new Error(`invalid size for ${fileName}`)
+  const size = Number.isFinite(chunkBytes) && chunkBytes > 0 ? Math.floor(chunkBytes) : DEFAULT_CHUNK_BYTES
+  const parts = []
+  let offset = 0
+  let index = 0
+  while (offset < totalBytes) {
+    const bytes = Math.min(size, totalBytes - offset)
+    parts.push({ index, name: `${fileName}.part${index}`, bytes, offset })
+    offset += bytes
+    index += 1
+  }
+  return parts
+}
+
+/**
+ * Writes the chunks of `sourcePath` into `targetDir` (one read of at most `chunkBytes` at a time, so
+ * even a 131 MB file never has to sit in memory twice) and returns their exact sizes and hashes.
+ */
+export async function splitFileIntoParts({ sourcePath, targetDir, spec, parts, hashFile = sha256File }) {
+  const handle = await open(sourcePath, 'r')
+  const written = []
+  try {
+    for (const part of parts) {
+      const buffer = Buffer.alloc(part.bytes)
+      const { bytesRead } = await handle.read(buffer, 0, part.bytes, part.offset)
+      if (bytesRead !== part.bytes) {
+        throw new Error(`${spec.name}: only ${bytesRead} of ${part.bytes} bytes read while splitting`)
+      }
+      const partPath = join(targetDir, part.name)
+      await writeFile(partPath, buffer)
+      const sha256 = await hashFile(partPath)
+      written.push({ name: part.name, bytes: bytesRead, sha256 })
+    }
+  } finally {
+    await handle.close()
+  }
+  return written
+}
+
+/** Removes stale chunks (`*.part3`, …) of a file whose split layout changed. */
+export async function removeStaleParts(targetDir, fileName, keepNames = []) {
+  const keep = new Set(keepNames)
+  for (const entry of await readdir(targetDir)) {
+    if (!entry.startsWith(`${fileName}.part`)) continue
+    if (keep.has(entry)) continue
+    await rm(join(targetDir, entry), { force: true }).catch(() => undefined)
+  }
+}
+
+/** Manifest the browser (and `verify:deployed`) reads to know how a file is split. */
+export function buildPartsManifest(entries, chunkBytes = DEFAULT_CHUNK_BYTES) {
+  return {
+    version: 1,
+    chunkBytes,
+    files: Object.fromEntries(
+      entries.map((entry) => [
+        entry.name,
+        {
+          bytes: entry.bytes,
+          sha256: entry.sha256 ?? null,
+          parts: entry.parts.map((part) => ({ name: part.name, bytes: part.bytes, sha256: part.sha256 ?? null })),
+        },
+      ]),
+    ),
+  }
+}
+
+export async function writePartsManifest(targetDir, manifest, { writeFileImpl = writeFile } = {}) {
+  await writeFileImpl(join(targetDir, MODEL_PARTS_FILE), `${JSON.stringify(manifest, null, 2)}\n`, 'utf8')
+}
+
+export async function readPartsManifest(targetDir, { readFileImpl = readFile } = {}) {
+  try {
+    return JSON.parse(await readFileImpl(join(targetDir, MODEL_PARTS_FILE), 'utf8'))
+  } catch {
+    return null
+  }
 }
 
 export function formatBytes(bytes) {
@@ -240,10 +336,48 @@ export async function runDownload({
    * `probeShenavaModel` accepts that mixed setup, and the engine caches them on the device.
    * `null` ships everything.
    */
-  maxBytes = null,
+  maxBytes = DEFAULT_HOST_FILE_LIMIT,
+  /**
+   * When `true` (default) a file above `maxBytes` is split into chunks below it instead of being
+   * left out of the build: the model then still comes from the app's own origin, which is the only
+   * route that works on networks where the third-party host is blocked. `SHENAVA_MODEL_SPLIT=0`
+   * restores the old "leave it to the browser" behaviour.
+   */
+  split = true,
+  chunkBytes = DEFAULT_CHUNK_BYTES,
+  /** `--check` never touches the network or the disk: existing files/chunks are verified only. */
+  check = false,
+  splitFile = splitFileIntoParts,
 } = {}) {
   await mkdir(targetDir, { recursive: true })
   if (cacheDir && resolve(cacheDir) !== resolve(targetDir)) await mkdir(cacheDir, { recursive: true })
+
+  const splitEntries = []
+
+  /** Downloads `spec` into the build cache when the copy there is missing or broken. */
+  const ensureCached = async (path, spec, required = false) => {
+    if (!path) return false
+    const cached = await describeLocalFile(path, spec, { hashFile })
+    if (cached.status === 'ok') return true
+    if (check) return false
+    try {
+      await downloadFile({
+        url: modelFileUrl(spec.name, { endpoint: endpoints[0] }),
+        targetPath: path,
+        spec,
+        fetchImpl,
+        hashFile,
+        attempts,
+        sleep,
+      })
+      return true
+    } catch (error) {
+      if (required) {
+        summary.errors.push(`${spec.name}: ${error instanceof Error ? error.message : String(error)}`)
+      }
+      return false
+    }
+  }
 
   const summary = {
     downloaded: 0,
@@ -251,6 +385,7 @@ export async function runDownload({
     skipped: 0,
     failed: 0,
     excluded: 0,
+    split: 0,
     errors: [],
     files: [],
     bytes: 0,
@@ -264,33 +399,94 @@ export async function runDownload({
     const cachedPath = cacheDir && resolve(cacheDir) !== resolve(targetDir) ? join(cacheDir, spec.name) : null
 
     if (maxBytes !== null && spec.bytes > maxBytes) {
-      // Still download it into the cache so a later build (or a manual copy) has it, but keep it out
-      // of the shipped files: the browser loads it straight from Hugging Face on first use.
-      if (cachedPath) {
-        const cached = await describeLocalFile(cachedPath, spec, { hashFile })
-        if (cached.status !== 'ok') {
-          try {
-            await downloadFile({
-              url: modelFileUrl(spec.name, { endpoint: endpoints[0] }),
-              targetPath: cachedPath,
-              spec,
-              fetchImpl,
-              hashFile,
-              attempts,
-              sleep,
-            })
-          } catch (error) {
-            summary.errors.push(`${spec.name}: ${error instanceof Error ? error.message : String(error)}`)
-          }
+      const parts = split ? planParts(spec.name, spec.bytes, chunkBytes) : []
+
+      if (!split) {
+        // Old behaviour: keep the file out of the shipped files, the browser downloads it once.
+        if (cachedPath) await ensureCached(cachedPath, spec)
+        await rm(targetPath, { force: true }).catch(() => undefined)
+        await removeStaleParts(targetDir, spec.name)
+        summary.excluded += 1
+        summary.files.push({ name: spec.name, status: 'excluded', size: spec.bytes })
+        summary.report.push({ name: spec.name, status: 'excluded', bytes: spec.bytes, ms: 0, sha256: spec.sha256 })
+        logger.warn(
+          `SKIP  ${spec.name} (${formatBytes(spec.bytes)}) از حد مجاز میزبان بزرگ‌تر است؛ ` +
+            'مرورگر آن را در اولین استفاده از Hugging Face می‌گیرد و روی دستگاه کش می‌کند',
+        )
+        continue
+      }
+
+      if (check) {
+        const manifest = await readPartsManifest(targetDir)
+        const listed = manifest?.files?.[spec.name]
+        const expectedParts = listed?.parts?.length === parts.length ? listed.parts : parts.map((part) => ({ name: part.name, bytes: part.bytes }))
+        const wrong = []
+        for (const part of expectedParts) {
+          const partPath = join(targetDir, part.name)
+          const info = await describeLocalFile(partPath, { name: part.name, bytes: part.bytes, sha256: part.sha256 ?? null }, { hashFile })
+          if (info.status !== 'ok') wrong.push(part.name)
+        }
+        if (wrong.length === 0) {
+          summary.split += 1
+          summary.bytes += spec.bytes
+          summary.files.push({ name: spec.name, status: 'split', size: spec.bytes, parts: expectedParts.length })
+          summary.report.push({ name: spec.name, status: 'split', bytes: spec.bytes, ms: 0, sha256: spec.sha256, parts: expectedParts.length })
+          logger.log(`OK    ${spec.name} به ${expectedParts.length} تکه تقسیم شده و سالم است (${formatBytes(spec.bytes)})`)
+        } else {
+          summary.failed += 1
+          summary.errors.push(`${spec.name}: تکه‌های ناقص → ${wrong.join(', ')}`)
+          summary.files.push({ name: spec.name, status: 'failed', size: spec.bytes })
+          logger.error(`FAIL  ${spec.name}: تکه‌های ناقص یا غایب → ${wrong.join(', ')}`)
+        }
+        continue
+      }
+
+      // The full file is needed once, to be cut into chunks. It stays in the build cache, never in
+      // `public/` (Vite copies that into `dist/`, and the host would reject the 125 MiB file).
+      let sourcePath = null
+      for (const candidate of [cachedPath, targetPath]) {
+        if (!candidate) continue
+        const info = await describeLocalFile(candidate, spec, { hashFile })
+        if (info.status === 'ok') {
+          sourcePath = candidate
+          break
         }
       }
-      await rm(targetPath, { force: true }).catch(() => undefined)
-      summary.excluded += 1
-      summary.files.push({ name: spec.name, status: 'excluded', size: spec.bytes })
-      logger.warn(
-        `SKIP  ${spec.name} (${formatBytes(spec.bytes)}) از حد مجاز میزبان بزرگ‌تر است؛ ` +
-          'مرورگر آن را در اولین استفاده از Hugging Face می‌گیرد و روی دستگاه کش می‌کند',
-      )
+      if (!sourcePath) {
+        const downloadTarget = cachedPath ?? targetPath
+        if (await ensureCached(downloadTarget, spec, true)) sourcePath = downloadTarget
+      }
+      if (!sourcePath) {
+        summary.failed += 1
+        if (!summary.errors.some((entry) => entry.startsWith(`${spec.name}:`))) {
+          summary.errors.push(`${spec.name}: نسخهٔ کامل برای تقسیم در دسترس نیست`)
+        }
+        summary.files.push({ name: spec.name, status: 'failed', size: spec.bytes })
+        logger.error(`FAIL  ${spec.name}: نسخهٔ کامل برای تقسیم در دسترس نیست؛ موتور آفلاین غیرفعال می‌ماند`)
+        continue
+      }
+
+      try {
+        const startedAt = Date.now()
+        const written = await splitFile({ sourcePath, targetDir, spec, parts, hashFile })
+        await removeStaleParts(targetDir, spec.name, written.map((part) => part.name))
+        await rm(targetPath, { force: true }).catch(() => undefined)
+        const elapsedMs = Date.now() - startedAt
+        summary.split += 1
+        summary.bytes += spec.bytes
+        summary.files.push({ name: spec.name, status: 'split', size: spec.bytes, parts: written.length })
+        summary.report.push({ name: spec.name, status: 'split', bytes: spec.bytes, ms: elapsedMs, sha256: spec.sha256, parts: written.length })
+        splitEntries.push({ name: spec.name, bytes: spec.bytes, sha256: spec.sha256, parts: written })
+        logger.log(
+          `SPLIT ${spec.name} به ${written.length} تکهٔ هم‌مبدأ تقسیم شد ` +
+            `(${written.map((part) => formatBytes(part.bytes)).join(' + ')} در ${(elapsedMs / 1000).toFixed(1)} ثانیه)`,
+        )
+      } catch (error) {
+        summary.failed += 1
+        summary.errors.push(`${spec.name}: ${error instanceof Error ? error.message : String(error)}`)
+        summary.files.push({ name: spec.name, status: 'failed', size: spec.bytes })
+        logger.error(`FAIL  ${spec.name}: تقسیم‌کردن فایل ناموفق بود — ${error instanceof Error ? error.message : error}`)
+      }
       continue
     }
 
@@ -364,6 +560,19 @@ export async function runDownload({
     }
   }
 
+  // The manifest is the only thing the browser needs to know a file is split; a stale one would make
+  // the probe believe in chunks that are no longer there, so its absence is written explicitly.
+  try {
+    if (splitEntries.length > 0) {
+      await writePartsManifest(targetDir, buildPartsManifest(splitEntries, chunkBytes))
+      summary.partsManifest = MODEL_PARTS_FILE
+    } else {
+      await rm(join(targetDir, MODEL_PARTS_FILE), { force: true }).catch(() => undefined)
+    }
+  } catch (error) {
+    summary.errors.push(`${MODEL_PARTS_FILE}: ${error instanceof Error ? error.message : String(error)}`)
+  }
+
   return summary
 }
 
@@ -375,11 +584,16 @@ function resolvePath(value, cwd) {
 export function resolveConfiguration({ argv = process.argv.slice(2), env = process.env, cwd = process.cwd() } = {}) {
   const { flags, options } = parseArgs(argv)
   const envMaxBytes = Number(env.SHENAVA_MODEL_MAX_BUILD_BYTES ?? '')
+  // Without an explicit budget the two documented host limits still apply: a single file above
+  // 100 MB would fail the deployment outright, so anything bigger is split instead of shipped whole.
   const maxBytes = Number.isFinite(options.maxBytes)
     ? options.maxBytes
     : Number.isFinite(envMaxBytes) && envMaxBytes > 0
       ? envMaxBytes
-      : null
+      : DEFAULT_HOST_FILE_LIMIT
+  const envChunkBytes = Number(env.SHENAVA_MODEL_CHUNK_BYTES ?? '')
+  const chunkBytes = Number.isFinite(envChunkBytes) && envChunkBytes > 0 ? envChunkBytes : DEFAULT_CHUNK_BYTES
+  const split = env.SHENAVA_MODEL_SPLIT !== '0' && env.SHENAVA_MODEL_SPLIT !== 'false'
   const endpoints = options.endpoints.length > 0 ? options.endpoints : endpointsFromEnv(env)
   const mirrors = options.mirrors.length > 0 ? options.mirrors : mirrorsFromEnv(env)
   const disabled = env.SHENAVA_MODEL_DOWNLOAD === '0' || env.SHENAVA_MODEL_DOWNLOAD === 'false'
@@ -394,7 +608,8 @@ export function resolveConfiguration({ argv = process.argv.slice(2), env = proce
     disabled,
     skippedForPages,
     maxBytes,
-    mirrors: mirrorsFromEnv(env),
+    chunkBytes,
+    split,
     targetDir: resolvePath(options.dir ?? env.SHENAVA_MODEL_DIR ?? DEFAULT_TARGET_DIR, cwd),
     cacheDir: resolvePath(env.SHENAVA_MODEL_CACHE_DIR ?? DEFAULT_CACHE_DIR, cwd),
     manifestPath: resolvePath(env.SHENAVA_MODEL_MANIFEST, cwd),
@@ -415,9 +630,13 @@ const HELP = `نصب مدل گفتار آفلاین شنوا کوچیک ۱.۵ (i
   --endpoint=...  میزبان جایگزین با ساختار Hugging Face (چند بار قابل تکرار)
   --mirror=...    پوشهٔ flat مدل (مثلاً GitHub Release؛ چند بار قابل تکرار)
 
+  فایل بزرگ‌تر از سقف میزبان (پیش‌فرض ۱۰۰ مگابایت) به تکه‌های ۶۴ مگابایتی تقسیم می‌شود و
+  مرورگر آن‌ها را در حافظه به هم می‌چسباند؛ فایل «model-parts.json» این تقسیم را توصیف می‌کند.
+
   متغیرهای محیطی: HF_ENDPOINT، SHENAVA_MODEL_MIRROR، SHENAVA_MODEL_DOWNLOAD،
   SHENAVA_MODEL_DIR، SHENAVA_MODEL_CACHE_DIR، SHENAVA_MODEL_MANIFEST،
-  SHENAVA_MODEL_MAX_BUILD_BYTES، SHENAVA_MODEL_REPORT`
+  SHENAVA_MODEL_MAX_BUILD_BYTES، SHENAVA_MODEL_CHUNK_BYTES، SHENAVA_MODEL_SPLIT،
+  SHENAVA_MODEL_REPORT`
 
 export async function main({ argv = process.argv.slice(2), env = process.env, cwd = process.cwd(), logger = console } = {}) {
   const config = resolveConfiguration({ argv, env, cwd })
@@ -451,12 +670,15 @@ export async function main({ argv = process.argv.slice(2), env = process.env, cw
     mirrors: config.mirrors,
     force: config.flags.force && !config.flags.check,
     maxBytes: config.maxBytes,
+    split: config.split,
+    chunkBytes: config.chunkBytes,
+    check: config.flags.check,
     logger: config.flags.quiet ? { log: () => {}, warn: () => {} } : logger,
   })
 
   logger.log(
     `خلاصه: ${summary.downloaded} دانلود، ${summary.copied} از کش، ${summary.skipped} از قبل موجود، ` +
-      `${summary.excluded} خارج از build، ${summary.failed} ناموفق`,
+      `${summary.split} تقسیم‌شده، ${summary.excluded} خارج از build، ${summary.failed} ناموفق`,
   )
 
   if (config.reportPath) {
@@ -470,6 +692,7 @@ export async function main({ argv = process.argv.slice(2), env = process.env, cw
         downloaded: summary.downloaded,
         copied: summary.copied,
         skipped: summary.skipped,
+        split: summary.split,
         excluded: summary.excluded,
         failed: summary.failed,
       },
@@ -481,14 +704,12 @@ export async function main({ argv = process.argv.slice(2), env = process.env, cw
   }
 
   const shipped = summary.bytes
-  if (config.maxBytes === null && shipped > VERCEL_HOBBY_STATIC_LIMIT) {
+  if (shipped > VERCEL_HOBBY_STATIC_LIMIT && summary.split === 0 && summary.excluded === 0) {
     logger.warn(
       `⚠️  حجم مدلی که همراه build منتشر می‌شود ${formatBytes(shipped)} است و از حد ۱۰۰ مگابایتی ` +
         'آپلود فایل استاتیک در پلن Hobby ورسل بیشتر است.',
     )
-    logger.warn('    اگر استقرار Vercel با خطای حجم شکست خورد، یکی از این دو راه:')
-    logger.warn('    • SHENAVA_MODEL_MAX_BUILD_BYTES=100000000 — فایل بزرگ در build نمی‌آید و مرورگر آن را از Hugging Face می‌گیرد')
-    logger.warn('    • SHENAVA_MODEL_DOWNLOAD=0 — هیچ فایلی همراه build نمی‌آید')
+    logger.warn('    یکی از این دو راه: در build تقسیم شود (پیش‌فرض) یا با SHENAVA_MODEL_MAX_BUILD_BYTES فایل بزرگ بیرون بماند')
   }
 
   if (summary.failed > 0) {

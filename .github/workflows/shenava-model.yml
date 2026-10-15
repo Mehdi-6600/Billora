@@ -248,6 +248,8 @@ jobs:
             echo
             echo "منبع دانلود: \`https://huggingface.co\` (پیش‌فرض) · ماشین: GitHub runner"
             echo
+            echo 'اگر انکودر از سقف میزبان بزرگ‌تر باشد، همین build آن را به تکه‌های ۶۴ مگابایتی تقسیم می‌کند؛ ستون `split` در شمارش‌های زیر تعداد فایل‌های تقسیم‌شده است.'
+            echo
             echo '```json'
             cat "$REPORT" 2>/dev/null || echo '{}'
             echo '```'

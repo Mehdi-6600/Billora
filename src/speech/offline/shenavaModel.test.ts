@@ -1,6 +1,11 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import {
   configuredRemoteBaseUrl,
+  loadPartsManifest,
+  parsePartsManifest,
+  partsForFile,
+  partsTotalBytes,
+  SHENAVA_PARTS_FILE,
   currentBaseHref,
   probeShenavaModelFiles,
   resolveAbsoluteUrl,
@@ -336,5 +341,133 @@ describe('ساخت آدرس مطلق برای worker (باگ «Invalid base URL�
     expect(currentBaseHref({ location: { href: '' } })).toBeNull()
     expect(currentBaseHref({ location: {} })).toBeNull()
     expect(currentBaseHref({})).toBeNull()
+  })
+})
+
+describe('تقسیم فایل بزرگ به تکه‌های هم‌مبدأ (سقف حجم میزبان)', () => {
+  const encoder = SHENAVA_MODEL_FILES[0]!
+  const chunkBytes = 64 * 1024 * 1024
+  const manifest = {
+    version: 1,
+    chunkBytes,
+    files: {
+      [encoder.name]: {
+        bytes: encoder.bytes,
+        sha256: encoder.sha256,
+        parts: [
+          { name: `${encoder.name}.part0`, bytes: chunkBytes, sha256: 'aa' },
+          { name: `${encoder.name}.part1`, bytes: encoder.bytes - chunkBytes, sha256: 'bb' },
+        ],
+      },
+    },
+  }
+
+  /** Same-origin server: the encoder is missing, but its two chunks are there. */
+  function partsFetcher({ partsOk = true, manifestBody = manifest as unknown } = {}) {
+    return vi.fn(async (url: string, init?: { method?: string }) => {
+      if (url.endsWith(SHENAVA_PARTS_FILE)) {
+        return {
+          ok: true,
+          status: 200,
+          headers: { get: () => null },
+          json: async () => manifestBody,
+        } as never
+      }
+      const part = manifest.files[encoder.name]!.parts.find((entry) => url.endsWith(entry.name))
+      if (part && partsOk) return response({ 'content-length': String(part.bytes) })
+      const file = SHENAVA_MODEL_FILES.find((entry) => url.endsWith(entry.name))
+      if (file && file.name !== encoder.name) return response({ 'content-length': String(file.bytes) })
+      if (part) return response({}, partsOk, 404)
+      void init
+      return response({}, false, 404)
+    })
+  }
+
+  it('manifest و تکه‌ها درست تجزیه می‌شوند', () => {
+    const parsed = parsePartsManifest(manifest)!
+    expect(parsed.files[encoder.name]!.parts).toHaveLength(2)
+    expect(partsForFile(parsed, encoder.name, encoder.bytes)).toHaveLength(2)
+    // حجم کل تکه‌ها باید با حجم اعلام‌شدهٔ فایل یکی باشد
+    expect(partsForFile(parsed, encoder.name, encoder.bytes - 1)).toBeNull()
+    expect(partsForFile(parsed, 'decoder.int8.onnx')).toBeNull()
+    expect(partsTotalBytes(parsed.files[encoder.name]!.parts)).toBe(encoder.bytes)
+
+    // manifest خراب (بدون files یا با ورودی ناقص) یعنی «تکه‌ای وجود ندارد»، نه خطا
+    expect(parsePartsManifest(null)).toBeNull()
+    expect(parsePartsManifest({})).toBeNull()
+    expect(parsePartsManifest({ files: { x: { bytes: 1, parts: [] } } })).toBeNull()
+    expect(parsePartsManifest({ files: { x: { bytes: 1, parts: [{ name: 'x.part0', bytes: 0 }] } } })).toBeNull()
+    // تکهٔ متعلق به فایل دیگر پذیرفته نمی‌شود
+    expect(partsForFile({ files: { 'a.onnx': { bytes: 4, parts: [{ name: 'b.onnx.part0', bytes: 4 }] } } }, 'a.onnx')).toBeNull()
+  })
+
+  it('وقتی انکودر تکه‌تکه سرو می‌شود، موتور در دسترس و منبع local است', async () => {
+    stubRuntime(true)
+    const fetcher = partsFetcher()
+    const detailed = await probeShenavaModelFiles(fetcher, '/', undefined, true)
+
+    expect(detailed.available).toBe(true)
+    expect(detailed.source).toBe('local')
+    expect(detailed.missing).toEqual([])
+    const encoderReport = detailed.files.find((report) => report.name === encoder.name)!
+    expect(encoderReport).toMatchObject({ local: 'ok', localBytes: encoder.bytes, parts: 2, remote: 'not-checked' })
+    expect(encoderReport.partsUrl).toBe(`/models/shenava/${encoder.name}.part0`)
+  })
+
+  it('نبود یک تکه یعنی فایل نصب‌شده نیست (و دیگر به میزبان بیرونی تکیه نمی‌کند)', async () => {
+    stubRuntime(true)
+    const fetcher = partsFetcher({ partsOk: false })
+    const detailed = await probeShenavaModelFiles(fetcher, '/', undefined, true)
+
+    const encoderReport = detailed.files.find((report) => report.name === encoder.name)!
+    expect(encoderReport.parts).toBe(2)
+    expect(encoderReport.partsState).toBe('absent')
+    expect(detailed.available).toBe(false)
+    expect(detailed.missing).toEqual([encoder.name])
+  })
+
+  it('manifest با جمع ناهمخوان نادیده گرفته می‌شود (تکه‌ها فایل دیگری‌اند)', async () => {
+    stubRuntime(true)
+    const wrong = JSON.parse(JSON.stringify(manifest)) as typeof manifest
+    wrong.files[encoder.name]!.parts[1]!.bytes = encoder.bytes - chunkBytes - 1
+    const fetcher = partsFetcher({ manifestBody: wrong })
+    const detailed = await probeShenavaModelFiles(fetcher, '/', undefined, true)
+
+    const encoderReport = detailed.files.find((report) => report.name === encoder.name)!
+    expect(encoderReport.parts).toBeUndefined()
+    expect(encoderReport.local).toBe('absent')
+    expect(detailed.available).toBe(false)
+  })
+
+  it('نبود manifest (۴۰۴ در SPA یا سرور قدیمی) رفتار قبلی را حفظ می‌کند', async () => {
+    stubRuntime(true)
+    const fetcher = vi.fn(async (url: string) => {
+      if (url.endsWith(SHENAVA_PARTS_FILE)) return response({ 'content-type': 'text/html' }, true, 200) as never
+      const file = SHENAVA_MODEL_FILES.find((entry) => url.endsWith(entry.name))
+      if (file) return response({ 'content-length': String(file.bytes) })
+      return response({}, false, 404)
+    })
+
+    const detailed = await probeShenavaModelFiles(fetcher, '/', undefined, true)
+    // پاسخ HTML برای manifest یعنی JSON ندارد → null → همهٔ فایل‌ها مثل قبل محلی‌اند
+    expect(detailed.available).toBe(true)
+    expect(detailed.source).toBe('local')
+  })
+
+  it('loadPartsManifest خطای شبکه را بی‌صدا null می‌کند', async () => {
+    const failing = vi.fn(async () => {
+      throw new Error('offline')
+    })
+    expect(await loadPartsManifest(failing as never, '/')).toBeNull()
+
+    const loader = vi.fn(async (_url: string) => ({
+      ok: true,
+      status: 200,
+      headers: { get: (): string | null => null },
+      json: async () => manifest,
+    }))
+    const loaded = await loadPartsManifest(loader as never, '/Billora/')
+    expect(loader.mock.calls[0]?.[0]).toBe(`/Billora/models/shenava/${SHENAVA_PARTS_FILE}`)
+    expect(loaded?.files[encoder.name]?.parts).toHaveLength(2)
   })
 })

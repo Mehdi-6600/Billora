@@ -48,6 +48,7 @@ function FileTable({ files }: { files: ShenavaFileReport[] }) {
           <th>روی همین دامنه</th>
           <th>روی میزبان بیرونی</th>
           <th>وضعیت نهایی</th>
+          <th>تکه‌ها</th>
         </tr>
       </thead>
       <tbody>
@@ -64,6 +65,24 @@ function FileTable({ files }: { files: ShenavaFileReport[] }) {
                   : `${STATE_LABELS[file.remote] ?? file.remote} (${formatBytes(file.remoteBytes)})`}
               </td>
               <td>{usable ? '✅ قابل استفاده' : '❌ ناموجود'}</td>
+              <td>
+                {file.parts ? (
+                  <>
+                    {`${file.parts} تکه (جمع ${formatBytes(file.expectedBytes)})`}
+                    {file.partsState && file.partsState !== 'ok'
+                      ? ` — مشکل: ${STATE_LABELS[file.partsState] ?? file.partsState}`
+                      : ''}
+                    {file.partsUrl ? (
+                      <>
+                        {' '}
+                        <code dir="ltr">{file.partsUrl.split('/').pop()}</code>
+                      </>
+                    ) : null}
+                  </>
+                ) : (
+                  '—'
+                )}
+              </td>
             </tr>
           )
         })}
@@ -262,7 +281,20 @@ function DiagnosticPage() {
         <h3>محیط اجرا</h3>
         <MetricRow label="مسیر مدل" value={shenavaModelUrl('encoder.int8.onnx', import.meta.env.BASE_URL)} />
         <MetricRow label="موجود بودن مدل" value={availability === null ? 'در حال بررسی…' : availability.available ? 'موجود' : `ناقص (${availability.missing.join(', ') || 'نامشخص'})`} />
-        <MetricRow label="منبع مدل" value={modelSource === 'local' ? 'کنار خود برنامه' : modelSource === 'hub' ? 'نصب‌نشده؛ دانلود یک‌بار از Hugging Face' : modelSource === 'mixed' ? 'بخشی همراه برنامه، بقیه یک‌بار از Hugging Face' : '—'} />
+        <MetricRow label="منبع مدل" value={modelSource === 'local' ? 'کنار خود برنامه (تکه‌ها هم همین‌جا)' : modelSource === 'hub' ? 'نصب‌نشده؛ دانلود یک‌بار از Hugging Face' : modelSource === 'mixed' ? 'بخشی همراه برنامه، بقیه یک‌بار از Hugging Face' : '—'} />
+        <MetricRow
+          label="فایل تقسیم‌شده"
+          value={
+            availability === null
+              ? '—'
+              : availability.files.some((file) => file.parts)
+                ? availability.files
+                    .filter((file) => file.parts)
+                    .map((file) => `${file.name}: ${file.parts} تکه`)
+                    .join(' · ')
+                : 'ندارد (همهٔ فایل‌ها یکجا سرو می‌شوند)'
+          }
+        />
         <MetricRow label="Cross-Origin Isolated" value={isolated ? 'بله (چندرشته‌ای)' : 'خیر (تک‌رشته‌ای و کندتر)'} />
         <MetricRow label="hardwareConcurrency" value={String(navigator.hardwareConcurrency ?? 0)} />
         <MetricRow label="iOS-like" value={detectIosLike(environment) ? 'بله' : 'خیر'} />

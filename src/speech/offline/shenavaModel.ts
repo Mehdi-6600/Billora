@@ -39,6 +39,90 @@ export const SHENAVA_MODEL_FILES: readonly ShenavaModelFile[] = [
 
 export const SHENAVA_CACHE_NAME = 'billora-shenava-koochik-1.5-int8'
 
+/**
+ * Some hosts refuse single files above their static-upload limit (Vercel Hobby: 100 MB), which the
+ * 125 MiB encoder exceeds. Instead of shipping nothing and letting every browser download it from a
+ * third party, the build splits it into chunks below that limit and writes what it did into
+ * `model-parts.json`. The engine reassembles the chunks in memory, so the model still arrives from
+ * the app's own origin — the only route that keeps working when the third-party host is blocked.
+ */
+export const SHENAVA_PARTS_FILE = 'model-parts.json'
+
+export interface ShenavaModelPart {
+  /** File name next to the model files, e.g. `encoder.int8.onnx.part0`. */
+  readonly name: string
+  readonly bytes: number
+  readonly sha256?: string | null
+}
+
+export interface ShenavaPartsEntry {
+  readonly bytes: number
+  readonly sha256?: string | null
+  readonly parts: readonly ShenavaModelPart[]
+}
+
+export interface ShenavaPartsManifest {
+  readonly version?: number
+  readonly chunkBytes?: number
+  readonly files: Record<string, ShenavaPartsEntry>
+}
+
+/** Tolerant parser: a malformed manifest must never break the engine, it just means "no chunks". */
+export function parsePartsManifest(value: unknown): ShenavaPartsManifest | null {
+  if (!value || typeof value !== 'object') return null
+  const files = (value as { files?: unknown }).files
+  if (!files || typeof files !== 'object') return null
+  const parsed: Record<string, ShenavaPartsEntry> = {}
+  for (const [name, rawEntry] of Object.entries(files as Record<string, unknown>)) {
+    if (!rawEntry || typeof rawEntry !== 'object') continue
+    const entry = rawEntry as { bytes?: unknown; sha256?: unknown; parts?: unknown }
+    if (!Array.isArray(entry.parts)) continue
+    const parts: ShenavaModelPart[] = []
+    for (const rawPart of entry.parts) {
+      if (!rawPart || typeof rawPart !== 'object') continue
+      const part = rawPart as { name?: unknown; bytes?: unknown; sha256?: unknown }
+      if (typeof part.name !== 'string' || !Number.isFinite(Number(part.bytes)) || Number(part.bytes) <= 0) continue
+      parts.push({
+        name: part.name,
+        bytes: Number(part.bytes),
+        sha256: typeof part.sha256 === 'string' ? part.sha256 : null,
+      })
+    }
+    if (parts.length === 0) continue
+    parsed[name] = {
+      bytes: Number.isFinite(Number(entry.bytes)) ? Number(entry.bytes) : parts.reduce((sum, part) => sum + part.bytes, 0),
+      sha256: typeof entry.sha256 === 'string' ? entry.sha256 : null,
+      parts,
+    }
+  }
+  return Object.keys(parsed).length > 0 ? { files: parsed } : null
+}
+
+/**
+ * Chunks of `fileName`, but only when the manifest describes a complete, consistent split: the
+ * chunks must belong to that file and their sizes must add up to the published size. Anything else
+ * would look like an installed model while the engine would later fail to assemble it.
+ */
+export function partsForFile(
+  manifest: ShenavaPartsManifest | null,
+  fileName: string,
+  expectedBytes?: number,
+): ShenavaModelPart[] | null {
+  const entry = manifest?.files?.[fileName]
+  if (!entry || entry.parts.length === 0) return null
+  for (const part of entry.parts) {
+    if (!part.name.startsWith(`${fileName}.part`)) return null
+  }
+  const total = entry.parts.reduce((sum, part) => sum + part.bytes, 0)
+  if (expectedBytes !== undefined && total !== expectedBytes) return null
+  if (entry.bytes !== total) return null
+  return [...entry.parts]
+}
+
+export function partsTotalBytes(parts: readonly ShenavaModelPart[]): number {
+  return parts.reduce((sum, part) => sum + part.bytes, 0)
+}
+
 /** Upstream source of the same files, used once when nobody put them next to the app. */
 export const SHENAVA_HUB_REPO = 'Reza2kn/Shenava-Koochik-v1.5-RNNT-sherpa-onnx'
 export const SHENAVA_HUB_REVISION = 'main'
@@ -302,10 +386,32 @@ export interface ShenavaFileReport {
   localUrl: string
   /** URL of the remote copy that would be used, when remote checks are enabled. */
   remoteUrl: string | null
+  /** Number of same-origin chunks when the file ships split (see `SHENAVA_PARTS_FILE`). */
+  parts?: number | null
+  /** URL of the first chunk, so the diagnostic page can show where the bytes come from. */
+  partsUrl?: string | null
+  /** State of the chunk probe: `ok` when every chunk answered, otherwise the first failure. */
+  partsState?: FileState | 'partial'
 }
 
 export interface ShenavaDetailedAvailability extends ShenavaModelAvailability {
   files: ShenavaFileReport[]
+}
+
+/** Reads `model-parts.json` from the app's own origin; a missing or broken file means "no chunks". */
+export async function loadPartsManifest(
+  fetcher: Fetcher = globalThis.fetch as unknown as Fetcher,
+  baseUrl = '/',
+): Promise<ShenavaPartsManifest | null> {
+  try {
+    const response = await withTimeout(fetcher(shenavaModelUrl(SHENAVA_PARTS_FILE, baseUrl)), PROBE_TIMEOUT_MS)
+    if (!response.ok) return null
+    const body = (response as unknown as { json?: () => Promise<unknown> }).json
+    if (typeof body !== 'function') return null
+    return parsePartsManifest(await body.call(response))
+  } catch {
+    return null
+  }
 }
 
 /**
@@ -358,7 +464,36 @@ export async function probeShenavaModelFiles(
     })
   }
 
-  const localMissing = reports.filter((report) => report.local !== 'ok')
+  let localMissing = reports.filter((report) => report.local !== 'ok')
+
+  // A file the host refused to store can still be served by the same origin as chunks. They are
+  // checked only when something is missing, so an ordinary build pays nothing for this feature.
+  if (localMissing.length > 0) {
+    const manifest = await loadPartsManifest(fetcher, baseUrl)
+    for (const report of localMissing) {
+      const parts = partsForFile(manifest, report.name, report.expectedBytes)
+      if (!parts) continue
+      report.parts = parts.length
+      report.partsUrl = shenavaModelUrl(parts[0]!.name, baseUrl)
+      let complete = true
+      for (const part of parts) {
+        const described = await describeFile(fetcher, shenavaModelUrl(part.name, baseUrl), part.bytes)
+        if (described.state !== 'ok') {
+          complete = false
+          report.partsState = described.state
+          break
+        }
+      }
+      if (complete) {
+        report.local = 'ok'
+        report.localBytes = report.expectedBytes
+        localHits += 1
+      } else {
+        report.partsState = report.partsState ?? 'absent'
+      }
+    }
+    localMissing = reports.filter((report) => report.local !== 'ok')
+  }
 
   if (localMissing.length === 0) {
     return { available: true, missing: [], source: 'local', files: reports }

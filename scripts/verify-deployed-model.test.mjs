@@ -40,6 +40,8 @@ const INDEX_HTML = '<!doctype html><html lang="fa" dir="rtl"><body>Billora</body
  * @param {boolean} [options.isolated] send COOP/COEP
  * @param {boolean} [options.diagnosticPage] serve /test-shenava.html
  * @param {Record<string, number>} [options.overrideSizes] serve a wrong size for a file
+ * @param {object} [options.splitEncoder] the encoder is not served whole; its chunks are
+ *   `{ parts: [{name, bytes}], manifest: boolean, breakPart: string|null }`
  */
 function startHost(options = {}) {
   const {
@@ -49,6 +51,7 @@ function startHost(options = {}) {
     isolated = true,
     diagnosticPage = true,
     overrideSizes = {},
+    splitEncoder = null,
   } = options
 
   const server = createServer((request, response) => {
@@ -74,7 +77,42 @@ function startHost(options = {}) {
       return
     }
 
+    if (splitEncoder && path === '/models/shenava/model-parts.json') {
+      if (!splitEncoder.manifest) {
+        if (spaFallback) response.writeHead(200, headers).end(INDEX_HTML)
+        else response.writeHead(404, headers).end('not found')
+        return
+      }
+      const encoder = FILES.find((file) => file.name === 'encoder.int8.onnx')
+      const body = Buffer.from(
+        JSON.stringify({ version: 1, files: { [encoder.name]: { bytes: encoder.bytes, parts: splitEncoder.parts } } }),
+      )
+      response
+        .writeHead(200, { 'content-type': 'application/json', 'content-length': String(body.length) })
+        .end(body)
+      return
+    }
+    if (splitEncoder) {
+      const part = splitEncoder.parts.find((entry) => path === `/models/shenava/${entry.name}`)
+      if (part) {
+        if (part.name === splitEncoder.breakPart) {
+          response.writeHead(404, { 'content-type': 'text/plain' }).end('gone')
+          return
+        }
+        response
+          .writeHead(200, { 'content-type': 'application/octet-stream', 'content-length': String(part.bytes) })
+          .end(Buffer.alloc(part.bytes, 3))
+        return
+      }
+    }
+
     const wanted = FILES.find((file) => path === `/models/shenava/${file.name}`)
+    if (splitEncoder && wanted?.name === 'encoder.int8.onnx') {
+      // Not served whole: that is exactly the case the chunks exist for.
+      if (spaFallback) response.writeHead(200, headers).end(INDEX_HTML)
+      else response.writeHead(404, headers).end('not found')
+      return
+    }
     if (wanted) {
       if (!modelPresent) {
         if (spaFallback) response.writeHead(200, headers).end(INDEX_HTML)
@@ -275,5 +313,70 @@ describe('بررسی استقرار — خط فرمان', () => {
     const parsed = JSON.parse(lines.at(-1))
     assert.equal(parsed.ok, true)
     assert.equal(parsed.files.length, 4)
+  })
+})
+
+describe('بررسی استقرار — فایل‌های تقسیم‌شده (سقف حجم میزبان)', () => {
+  const parts = [
+    { name: 'encoder.int8.onnx.part0', bytes: 3072 },
+    { name: 'encoder.int8.onnx.part1', bytes: 1024 },
+  ]
+
+  it('فایلی که تکه‌تکه سرو می‌شود، قبول می‌شود و تکه‌ها گزارش می‌شوند', async () => {
+    const host1 = await host({ splitEncoder: { parts, manifest: true, breakPart: null } })
+    const results = await verifyDeployment({ baseUrl: host1.baseUrl, files: FILES, fetchImpl: fetch, logger: silent })
+
+    assert.equal(results.ok, true, JSON.stringify(results.failures))
+    assert.equal(results.parts.present, true)
+    const encoder = results.files.find((file) => file.name === 'encoder.int8.onnx')
+    assert.equal(encoder.servedAs, 'parts')
+    assert.equal(encoder.passed, true)
+    assert.equal(encoder.parts.length, 2)
+    assert.ok(encoder.parts.every((part) => part.passed))
+    // بقیهٔ فایل‌ها مثل قبل تک‌فایل هستند
+    assert.equal(results.files.find((file) => file.name === 'tokens.txt').servedAs, 'file')
+  })
+
+  it('تکهٔ غایب باعث شکست بررسی می‌شود و نامش در خطا می‌آید', async () => {
+    const host1 = await host({
+      splitEncoder: { parts, manifest: true, breakPart: 'encoder.int8.onnx.part1' },
+    })
+    const results = await verifyDeployment({ baseUrl: host1.baseUrl, files: FILES, fetchImpl: fetch, logger: silent })
+
+    assert.equal(results.ok, false)
+    const encoder = results.files.find((file) => file.name === 'encoder.int8.onnx')
+    assert.equal(encoder.servedAs, 'missing')
+    assert.equal(encoder.parts.find((part) => part.name === 'encoder.int8.onnx.part1').passed, false)
+    assert.match(results.failures.join('\n'), /encoder\.int8\.onnx\.part1/)
+  })
+
+  it('مانیفستی که جمع تکه‌هایش با حجم فایل یکی نیست، رد می‌شود', async () => {
+    const host1 = await host({
+      splitEncoder: { parts: [{ name: 'encoder.int8.onnx.part0', bytes: 100 }], manifest: true, breakPart: null },
+    })
+    const results = await verifyDeployment({ baseUrl: host1.baseUrl, files: FILES, fetchImpl: fetch, logger: silent })
+
+    assert.equal(results.ok, false)
+    const encoder = results.files.find((file) => file.name === 'encoder.int8.onnx')
+    assert.equal(encoder.parts[0].passed, false)
+    assert.match(encoder.parts[0].name, /manifest sums to 100 bytes, 4096 expected/)
+  })
+
+  it('نبود مانیفست یعنی build قدیمی است (بدون تکه) و خطایی نیست', async () => {
+    const host1 = await host({ splitEncoder: { parts, manifest: false, breakPart: null } })
+    const results = await verifyDeployment({ baseUrl: host1.baseUrl, files: FILES, fetchImpl: fetch, logger: silent })
+
+    assert.equal(results.parts.present, false)
+    // انکودر سرو نمی‌شود و تکه‌ای هم اعلام نشده → بررسی مثل قبل شکست می‌خورد
+    assert.equal(results.ok, false)
+    assert.equal(results.files.find((file) => file.name === 'decoder.int8.onnx').passed, true)
+  })
+
+  it('پاسخ HTML برای مانیفست (SPA fallback) نادیده گرفته می‌شود', async () => {
+    const host1 = await host({ modelPresent: false, spaFallback: true })
+    const results = await verifyDeployment({ baseUrl: host1.baseUrl, files: FILES, fetchImpl: fetch, logger: silent })
+
+    assert.equal(results.parts.present, false)
+    assert.equal(results.ok, false)
   })
 })
