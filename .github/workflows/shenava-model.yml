@@ -107,11 +107,22 @@ jobs:
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
 
+      - name: Show the downloaded files
+        run: |
+          ls -l public/models/shenava
+          echo '--- sha256 ---'
+          sha256sum public/models/shenava/*
+
+      - name: Build and confirm the model is inside dist
+        run: |
+          npm run build
+          ls -l dist/models/shenava
+
       - name: Confirm nothing in the build output exceeds the host's per-file limit
         run: |
           set -euo pipefail
           echo '--- dist/model files, sorted by size ---'
-          ls -lS dist/models/shenava
+          ls -lS dist/models/shenava || echo '(no model in dist for this build)'
           echo
           echo '--- files larger than 100 MB (must be empty for Vercel Hobby) ---'
           if find dist -type f -size +100M | grep -q .; then
@@ -123,17 +134,6 @@ jobs:
           echo
           echo '--- chunks manifest ---'
           cat dist/models/shenava/model-parts.json 2>/dev/null || echo 'no split file in this build'
-
-      - name: Show the downloaded files
-        run: |
-          ls -l public/models/shenava
-          echo '--- sha256 ---'
-          sha256sum public/models/shenava/*
-
-      - name: Build and confirm the model is inside dist
-        run: |
-          npm run build
-          ls -l dist/models/shenava
 
       - name: Publish the model as a release mirror
         if: env.PUBLISH_RELEASE == 'true'
