@@ -24,13 +24,14 @@ import { join } from 'node:path'
 import * as ort from 'onnxruntime-web/wasm'
 import { describe, expect, it } from 'vitest'
 
+import { decodeWavPcm16 } from './__fixtures__/wav'
 import { computeLogMel } from './features'
 import { assembleModelParts } from './modelParts'
 import { readMetadataInt, readOnnxMetadata } from './onnxMetadata'
 import { greedyDecodeNemo } from './rnnt'
 import { parsePartsManifest, partsForFile, SHENAVA_PARTS_FILE } from './shenavaModel'
-import { parseTokens } from './tokenizer'
-import { createTransducerRuntime, tensorSpecs } from './transducerRuntime'
+import { decodeTokens, parseTokens } from './tokenizer'
+import { createTransducerRuntime, describeTransducerPlan, tensorSpecs } from './transducerRuntime'
 
 ort.env.wasm.numThreads = 1
 
@@ -60,6 +61,27 @@ function signatureOf(session: ort.InferenceSession): string {
     .map((spec) => `${spec.name}:${spec.type}[${spec.shape.map((dim) => (typeof dim === 'number' ? dim : '?')).join(',')}]`)
     .join(' ')
   return `inputs { ${input} } outputs { ${output} }`
+}
+
+/** The encoder's own bytes: the single file when it exists, otherwise the parts the browser joins. */
+async function loadEncoderBytes(): Promise<Uint8Array> {
+  if (has('encoder.int8.onnx')) return readBytes('encoder.int8.onnx')
+  const manifest = parsePartsManifest(JSON.parse(readFileSync(join(MODEL_DIR, SHENAVA_PARTS_FILE), 'utf8')))
+  const parts = partsForFile(manifest, 'encoder.int8.onnx')
+  const entry = manifest?.files?.['encoder.int8.onnx']
+  if (!parts || !entry) throw new Error('encoder parts are missing')
+  const joined = await assembleModelParts({
+    fileName: 'encoder.int8.onnx',
+    bytes: entry.bytes,
+    parts,
+    urlFor: (name) => join(MODEL_DIR, name),
+    fetcher: async (url: string) => {
+      const body = readBytes(url.split('/').pop()!)
+      return { ok: true, status: 200, arrayBuffer: async () => body.buffer as ArrayBuffer }
+    },
+  })
+  expect(joined.byteLength).toBe(entry.bytes)
+  return joined
 }
 
 describe.skipIf(!present)('Shenava واقعی — امضای مدل و شکل تنسورها', () => {
@@ -141,24 +163,7 @@ describe.skipIf(!present)('Shenava واقعی — امضای مدل و شکل ت
   }, 300_000)
 
   it.skipIf(!withEncoder)('روی یک صدای کوچک، کل مسیر را با مدل واقعی اجرا می‌کند', async () => {
-    const encoderBytes = has('encoder.int8.onnx')
-      ? readBytes('encoder.int8.onnx')
-      : await (async () => {
-          const manifest = parsePartsManifest(JSON.parse(readFileSync(join(MODEL_DIR, SHENAVA_PARTS_FILE), 'utf8')))
-          const parts = partsForFile(manifest, 'encoder.int8.onnx')
-          const entry = manifest?.files?.['encoder.int8.onnx']
-          if (!parts || !entry) throw new Error('encoder parts are missing')
-          return assembleModelParts({
-            fileName: 'encoder.int8.onnx',
-            bytes: entry.bytes,
-            parts,
-            urlFor: (name) => join(MODEL_DIR, name),
-            fetcher: async (url: string) => {
-              const body = readBytes(url.split('/').pop()!)
-              return { ok: true, status: 200, arrayBuffer: async () => body.buffer as ArrayBuffer }
-            },
-          })
-        })()
+    const encoderBytes = await loadEncoderBytes()
 
     const metadata = readOnnxMetadata(encoderBytes)
     const hidden = readMetadataInt(metadata, 'pred_hidden') ?? 640
@@ -231,5 +236,121 @@ describe.skipIf(!present)('Shenava واقعی — امضای مدل و شکل ت
 
     expect(result.blankId).toBe(blankId)
     expect(result.tokenIds.every((id) => id >= 0 && id < vocabSize)).toBe(true)
+  }, 900_000)
+
+  it.skipIf(!withEncoder)('روی یک فایل صوتی واقعی فارسی متن تولید می‌کند (متن · توکن · زمان · شکل‌ها)', async () => {
+    // A real Persian sentence, committed next to this test (`__fixtures__/persian-command.wav`):
+    // «یک فاکتور برای آقای رضایی به مبلغ دویست هزار تومان ثبت کن. موجودی انبار را هم نشان بده.»
+    const wavBytes = new Uint8Array(readFileSync(new URL('./__fixtures__/persian-command.wav', import.meta.url)))
+    const audio = decodeWavPcm16(wavBytes)
+    let peak = 0
+    let sumSquares = 0
+    for (const sample of audio.samples) {
+      peak = Math.max(peak, Math.abs(sample))
+      sumSquares += sample * sample
+    }
+    console.info(
+      `[persian] wav: ${(audio.samples.length / audio.sampleRate).toFixed(2)} s · ${audio.sampleRate} Hz · ` +
+        `${audio.channels}ch · ${audio.samples.length} samples · peak=${peak.toFixed(3)} · ` +
+        `rms=${Math.sqrt(sumSquares / audio.samples.length).toFixed(3)}`,
+    )
+
+    const melStart = performance.now()
+    const { features, frames, dim } = computeLogMel(audio.samples)
+    const melMs = performance.now() - melStart
+    console.info(`[persian] log-mel: [1, ${dim}, ${frames}] (${melMs.toFixed(1)} ms)`)
+    expect(frames).toBeGreaterThan(0)
+    expect(dim).toBe(80)
+
+    const encoderBytes = await loadEncoderBytes()
+    const encoderMetadata = readOnnxMetadata(encoderBytes)
+    const hidden = readMetadataInt(encoderMetadata, 'pred_hidden') ?? 640
+    const layers = readMetadataInt(encoderMetadata, 'pred_rnn_layers') ?? 1
+    const tokens = parseTokens(readFileSync(join(MODEL_DIR, 'tokens.txt'), 'utf8'))
+    const vocabulary = readMetadataInt(encoderMetadata, 'vocab_size') ?? tokens.size - 1
+    const vocabSize = vocabulary + 1
+    const blankId = vocabSize - 1
+
+    const encoder = await createSession(encoderBytes)
+    const channelFirst = new Float32Array(frames * dim)
+    for (let t = 0; t < frames; t += 1) {
+      for (let d = 0; d < dim; d += 1) channelFirst[d * frames + t] = features[t * dim + d]!
+    }
+
+    // The real encoder wants an int64 length (the worker retries int32 → int64 the same way).
+    const runEncoder = async (dtype: 'int32' | 'int64') =>
+      encoder.run({
+        audio_signal: new ort.Tensor('float32', channelFirst, [1, dim, frames]),
+        length:
+          dtype === 'int64'
+            ? new ort.Tensor('int64', BigInt64Array.from([BigInt(frames)]), [1])
+            : new ort.Tensor('int32', Int32Array.from([frames]), [1]),
+      })
+
+    const encoderStart = performance.now()
+    let encoded: ort.InferenceSession.OnnxValueMapType
+    let lengthDtype: 'int32' | 'int64' = 'int32'
+    try {
+      encoded = await runEncoder('int32')
+    } catch {
+      lengthDtype = 'int64'
+      encoded = await runEncoder('int64')
+    }
+    const encoderMs = performance.now() - encoderStart
+    const encodedOut = encoded[encoder.outputNames[0]!] as ort.Tensor
+    const shape = (encodedOut.dims as readonly number[]).slice()
+    console.info(
+      `[persian] encoder: audio_signal [1, ${dim}, ${frames}] + length ${lengthDtype} → out [${shape.join(', ')}] ` +
+        `(${encoderMs.toFixed(1)} ms)`,
+    )
+    expect(shape).toHaveLength(3)
+    expect(shape[0]).toBe(1)
+    expect(shape[2]).toBeGreaterThan(0)
+
+    const encoderDim = shape[1]!
+    const encoderFrames = shape[2]!
+    const flat = encodedOut.data as Float32Array
+    const rowMajor = new Float32Array(encoderFrames * encoderDim)
+    for (let t = 0; t < encoderFrames; t += 1) {
+      for (let d = 0; d < encoderDim; d += 1) rowMajor[t * encoderDim + d] = flat[d * encoderFrames + t]!
+    }
+
+    const decoderBytes = readBytes('decoder.int8.onnx')
+    const decoder = await createSession(decoderBytes)
+    const joiner = await createSession(readBytes('joiner.int8.onnx'))
+    const decoderMetadata = readOnnxMetadata(decoderBytes)
+    const runtime = createTransducerRuntime({ decoder, joiner, encoderDim, blankId, layers, hidden, decoderMetadata })
+    console.info(
+      `[persian] plan: ${describeTransducerPlan({ decoder, joiner, encoderDim, blankId, layers, hidden, decoderMetadata })}`,
+    )
+
+    const decodeStart = performance.now()
+    const result = await greedyDecodeNemo(rowMajor, encoderFrames, encoderDim, runtime, { blankId })
+    const decodeMs = performance.now() - decodeStart
+
+    const pieces = result.tokenIds.map((id) => tokens.pieces[id] ?? `<${id}>`)
+    const meaningful = pieces.filter((piece) => !/^<[^>]*>$/.test(piece) && piece.replace(/▁/g, '').length > 0).length
+    const text = decodeTokens(result.tokenIds, tokens)
+    const words = text ? text.split(' ').filter(Boolean).length : 0
+
+    console.info(
+      `[persian] greedy decode: ${result.tokenIds.length} token(s) — ${meaningful} معنادار — over ${result.frames} frame(s) ` +
+        `(${decodeMs.toFixed(1)} ms)`,
+    )
+    console.info(`[persian] ids: [${result.tokenIds.join(',')}]`)
+    console.info(`[persian] pieces: [${pieces.join('|')}]`)
+    console.info(`[persian] متن تشخیص‌داده‌شده: «${text}» (${words} واژه)`)
+    console.info(
+      `[persian] total: ${(melMs + encoderMs + decodeMs).toFixed(1)} ms · ` +
+        `mel=[1,${dim},${frames}] encoder=[1,${encoderDim},${encoderFrames}] joiner decoder_outputs=[1,${hidden},1]`,
+    )
+
+    expect(result.frames).toBe(encoderFrames)
+    expect(result.blankId).toBe(blankId)
+    expect(result.tokenIds.every((id) => id >= 0 && id < vocabSize)).toBe(true)
+    expect(result.tokenIds.length).toBeGreaterThan(0)
+    expect(meaningful).toBeGreaterThan(0)
+    expect(text).not.toBe('')
+    expect(/[\u0600-\u06FF]/.test(text)).toBe(true)
   }, 900_000)
 })
