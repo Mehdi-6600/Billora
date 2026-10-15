@@ -166,6 +166,30 @@ jobs:
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
 
+      # Read-only proof about what the live site actually answers. This settles Q1 with real HTTP
+      # responses instead of guesses: the deployment domains sit behind Vercel Authentication, so an
+      # anonymous request can never return the model file — the exact response says why.
+      - name: Probe the live deployment over HTTP (read-only)
+        continue-on-error: true
+        env:
+          LIVE_URL: https://billora-ai-image-app.vercel.app
+        run: |
+          set -uo pipefail
+          {
+            echo "base: $LIVE_URL"
+            for path in / /test-shenava.html /models/shenava/encoder.int8.onnx /models/shenava/tokens.txt; do
+              echo
+              echo "=== GET $path ==="
+              curl -sS -m 60 -o /tmp/body -D - "$LIVE_URL$path" \
+                | sed -E 's/(set-cookie:).*/\1 <omitted>/I' \
+                | grep -iE '^(HTTP/|content-type|content-length|location|cross-origin|access-control|x-vercel|www-authenticate|server|set-cookie)' || true
+              echo "--- first 300 bytes of the body ---"
+              head -c 300 /tmp/body | tr -d '\000' | sed -e 's/[[:space:]]\+/ /g'
+              echo
+            done
+          } > live-probe.txt 2>&1
+          cat live-probe.txt
+
       - name: Check the live deployment (optional)
         if: env.VERIFY_URL != ''
         continue-on-error: true
@@ -202,6 +226,17 @@ jobs:
               echo '### هدرهای Hugging Face (منبع پشتیبان پیش‌فرض موتور)'
               echo '```'
               cat hf-headers.txt
+              echo '```'
+            fi
+            if [ -f mirror-verify.txt ]; then
+              echo
+              cat mirror-verify.txt
+            fi
+            if [ -f live-probe.txt ]; then
+              echo
+              echo '### پاسخ واقعی دامنهٔ Production (read-only، از ماشین runner)'
+              echo '```'
+              cat live-probe.txt
               echo '```'
             fi
             if [ -f mirror-headers.txt ]; then
