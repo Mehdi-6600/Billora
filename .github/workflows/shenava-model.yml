@@ -20,6 +20,10 @@ name: Shenava model — verify, mirror, report
 
 on:
   workflow_dispatch:
+  # TEMPORARY: lets this workflow be exercised on the feature branch. Removed before merging.
+  push:
+    branches:
+      - arena/d9de851e-billora
     inputs:
       publish_release:
         description: 'مدل را به یک GitHub Release پیوست کن (mirror عمومی)'
@@ -102,6 +106,23 @@ jobs:
             cat mirror-report.json
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Confirm nothing in the build output exceeds the host's per-file limit
+        run: |
+          set -euo pipefail
+          echo '--- dist/model files, sorted by size ---'
+          ls -lS dist/models/shenava
+          echo
+          echo '--- files larger than 100 MB (must be empty for Vercel Hobby) ---'
+          if find dist -type f -size +100M | grep -q .; then
+            echo 'FAIL: the deployment would be rejected'
+            find dist -type f -size +100M
+            exit 1
+          fi
+          echo 'none — every published file is below 100 MB'
+          echo
+          echo '--- chunks manifest ---'
+          cat dist/models/shenava/model-parts.json 2>/dev/null || echo 'no split file in this build'
 
       - name: Show the downloaded files
         run: |
