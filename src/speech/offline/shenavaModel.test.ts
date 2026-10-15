@@ -1,8 +1,11 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import {
+  configuredRemoteBaseUrl,
   currentBaseHref,
+  probeShenavaModelFiles,
   resolveAbsoluteUrl,
   resolveShenavaWorkerUrls,
+  shenavaRemoteFileUrl,
   SHENAVA_MODEL_FILES,
   shenavaModelDirectoryUrl,
   shenavaModelUrl,
@@ -172,6 +175,71 @@ describe('شناسایی نصب‌بودن مدل روی دستگاه', () => {
 
     const result = await probeShenavaModel(fetcher, '/', undefined, true, { allowRemote: true })
     expect(result).toMatchObject({ available: false, missing: [missingFile.name], reason: 'missing' })
+  })
+
+  it('گزارش هر فایل (محلی/بیرونی + حجم اندازه‌گیری‌شده) را برمی‌گرداند', async () => {
+    stubRuntime(true)
+    const encoder = SHENAVA_MODEL_FILES[0]
+    const fetcher = vi.fn(async (url: string) => {
+      const file = SHENAVA_MODEL_FILES.find((entry) => url.endsWith(entry.name))!
+      if (url.includes('/models/')) {
+        if (file.name === encoder.name) return { ok: false, status: 404, headers: { get: () => null } }
+        const length = file.name === 'tokens.txt' ? file.bytes : file.bytes
+        return response({ 'content-length': String(length) })
+      }
+      return response({ 'content-length': String(file.bytes) })
+    })
+
+    const detailed = await probeShenavaModelFiles(fetcher, '/', undefined, true, { allowRemote: true })
+    expect(detailed.source).toBe('mixed')
+    expect(detailed.files).toHaveLength(SHENAVA_MODEL_FILES.length)
+    const encoderReport = detailed.files.find((report) => report.name === encoder.name)!
+    expect(encoderReport).toMatchObject({ local: 'absent', localBytes: null, remote: 'ok', remoteBytes: encoder.bytes })
+    expect(encoderReport.localUrl).toBe(`/models/shenava/${encoder.name}`)
+    expect(encoderReport.remoteUrl).toContain('huggingface.co')
+    const decoderReport = detailed.files.find((report) => report.name === 'decoder.int8.onnx')!
+    expect(decoderReport).toMatchObject({ local: 'ok', remote: 'not-checked' })
+    expect(decoderReport.localBytes).toBe(SHENAVA_MODEL_FILES[1].bytes)
+  })
+
+  it('در حالت پشتیبانی‌نشده، گزارش هر فایل «غایب» است و درخواستی فرستاده نمی‌شود', async () => {
+    stubRuntime(false)
+    const fetcher = vi.fn()
+    const detailed = await probeShenavaModelFiles(fetcher as never, '/')
+    expect(detailed.available).toBe(false)
+    expect(detailed.reason).toBe('unsupported')
+    expect(detailed.files.every((report) => report.local === 'absent' && report.remote === 'not-checked')).toBe(true)
+    expect(fetcher).not.toHaveBeenCalled()
+  })
+
+  it('میزبان بیرونی از متغیر build خوانده می‌شود و Hugging Face را جایگزین می‌کند', () => {
+    expect(configuredRemoteBaseUrl({})).toBeNull()
+    expect(configuredRemoteBaseUrl({ VITE_SHENAVA_MODEL_BASE_URL: '   ' })).toBeNull()
+    const base = 'https://github.com/Mehdi-6600/Billora/releases/download/shenava-model-v1.5-int8/'
+    expect(configuredRemoteBaseUrl({ VITE_SHENAVA_MODEL_BASE_URL: base })).toBe(base.replace(/\/+$/, ''))
+    expect(shenavaRemoteFileUrl('encoder.int8.onnx', { remoteBaseUrl: base.replace(/\/+$/, '') }))
+      .toBe('https://github.com/Mehdi-6600/Billora/releases/download/shenava-model-v1.5-int8/encoder.int8.onnx')
+    // بدون تنظیم، پیش‌فرض همان Hugging Face است
+    expect(shenavaRemoteFileUrl('tokens.txt')).toContain('huggingface.co/Reza2kn/')
+  })
+
+  it('probe با میزبان بیرونی تنظیم‌شده، همان آدرس را بررسی می‌کند', async () => {
+    stubRuntime(true)
+    const seen: string[] = []
+    const fetcher = vi.fn(async (url: string) => {
+      seen.push(url)
+      if (url.startsWith('/models/')) return { ok: false, status: 404, headers: { get: () => null } }
+      const file = SHENAVA_MODEL_FILES.find((entry) => url.endsWith(entry.name))!
+      return response({ 'content-length': String(file.bytes) })
+    })
+
+    const result = await probeShenavaModelFiles(fetcher as never, '/', undefined, true, {
+      allowRemote: true,
+      remoteBaseUrl: 'https://mirror.example/models',
+    })
+    expect(result.source).toBe('hub')
+    expect(seen.every((url) => !url.includes('huggingface.co'))).toBe(true)
+    expect(seen).toContain('https://mirror.example/models/encoder.int8.onnx')
   })
 
   it('بدون Web Worker یا WebAssembly حتی درخواستی فرستاده نمی‌شود', async () => {

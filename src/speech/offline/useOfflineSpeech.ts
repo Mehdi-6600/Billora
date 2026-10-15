@@ -28,9 +28,11 @@ export interface OfflineSpeechOptions {
   createRecognizer?: () => ShenavaRecognizer
   captureFactory?: MicCaptureFactory
   probe?: () => Promise<ShenavaModelAvailability>
-  /** Allow the one-time download from the Hugging Face copy when the files are not installed. */
+  /** Allow the one-time download from the remote copy when the files are not installed. */
   allowRemoteModel?: boolean
   hubEndpoint?: string
+  /** Directory holding the remote copies (GitHub Release, Vercel Blob, R2, …). */
+  remoteBaseUrl?: string | null
   /** Post-processing of the raw transcript (the editor applies parser-guarded Persian ITN). */
   transformTranscript?: (text: string) => string
   /** Skips the initial HEAD probe; used by the standalone diagnostic page. */
@@ -97,6 +99,7 @@ export function useOfflineSpeech(options: OfflineSpeechOptions): OfflineSpeechSt
             baseUrl: optionsRef.current.baseUrl,
             allowRemoteModel: optionsRef.current.allowRemoteModel,
             hubEndpoint: optionsRef.current.hubEndpoint,
+            remoteBaseUrl: optionsRef.current.remoteBaseUrl,
           })
     }
     return recognizerRef.current

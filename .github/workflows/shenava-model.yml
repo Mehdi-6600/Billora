@@ -1,0 +1,150 @@
+name: Shenava model — verify, mirror, report
+
+# One manual workflow that answers every "is the model really usable?" question with facts, on a
+# machine that has internet access (a GitHub runner):
+#
+#   1. downloads the four files exactly like the Vercel build step does (`prebuild`), with a JSON
+#      report (bytes, milliseconds, SHA-256, endpoint) and `--strict` so any problem fails the job,
+#   2. re-checks them with `--check` (size + SHA-256 must match the app manifest),
+#   3. builds the app and shows that the files land in `dist/models/shenava/`,
+#   4. optionally attaches them to a GitHub Release, which then acts as a public model mirror for
+#      hosts that cannot serve the 131 MB encoder themselves,
+#   5. measures the release asset's real HTTP headers — including `access-control-allow-origin` and
+#      `cross-origin-resource-policy`, which decide whether a browser on a cross-origin isolated page
+#      (COEP: require-corp) is allowed to fetch it,
+#   6. optionally runs `scripts/verify-deployed-model.mjs` against a live deployment URL,
+#   7. posts the whole report as a comment, so the evidence is readable outside the Actions UI.
+#
+# Run: Actions → Shenava model — verify, mirror, report → Run workflow
+#      gh workflow run shenava-model.yml -f publish_release=true -f verify_deployed_url=https://…
+
+on:
+  workflow_dispatch:
+  # Temporary trigger so this workflow can be verified on its own branch before it reaches main.
+  push:
+    branches:
+      - arena/d9de851e-billora
+    inputs:
+      publish_release:
+        description: 'مدل را به یک GitHub Release پیوست کن (mirror عمومی)'
+        type: boolean
+        default: true
+      release_tag:
+        description: 'برچسب Release برای mirror مدل'
+        type: string
+        default: 'shenava-model-v1.5-int8'
+      verify_deployed_url:
+        description: 'آدرس استقرار برای بررسی واقعی (اختیاری، مثلاً https://billora.vercel.app)'
+        type: string
+        default: ''
+      report_issue:
+        description: 'شمارهٔ Issue برای ثبت گزارش (اختیاری)'
+        type: string
+        default: '8'
+
+permissions:
+  contents: write
+  issues: write
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    env:
+      REPORT: model-report.json
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Download the model (same script the build runs)
+        run: node scripts/download-shenava-model.mjs --strict --report="$REPORT"
+
+      - name: Verify sizes and SHA-256 against the app manifest
+        run: node scripts/download-shenava-model.mjs --check
+
+      - name: Show the downloaded files
+        run: |
+          ls -l public/models/shenava
+          echo '--- sha256 ---'
+          sha256sum public/models/shenava/*
+
+      - name: Build and confirm the model is inside dist
+        run: |
+          npm run build
+          ls -l dist/models/shenava
+
+      - name: Publish the model as a release mirror
+        if: ${{ inputs.publish_release }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ inputs.release_tag }}
+        run: |
+          set -euo pipefail
+          gh release view "$TAG" >/dev/null 2>&1 || gh release create "$TAG" \
+            --title "Shenava Koochik v1.5 RNNT int8 (mirror)" \
+            --notes "Mirror of the model files from https://huggingface.co/Reza2kn/Shenava-Koochik-v1.5-RNNT-sherpa-onnx used by Billora's offline speech engine. Downloaded and SHA-256 verified by CI; not part of the git repository."
+          gh release upload "$TAG" public/models/shenava/* --clobber
+
+      - name: Measure the mirror's HTTP headers (browser CORS requirements)
+        if: ${{ inputs.publish_release }}
+        env:
+          TAG: ${{ inputs.release_tag }}
+        run: |
+          set -euo pipefail
+          URL="https://github.com/${{ github.repository }}/releases/download/$TAG/encoder.int8.onnx"
+          echo "asset: $URL"
+          {
+            echo '### Release asset headers (encoder.int8.onnx)'
+            echo '```'
+            curl -sSL -o /dev/null -D - -H 'Origin: https://billora.example' -H 'Range: bytes=0-0' "$URL" \
+              | grep -iE '^(HTTP/|content-type|content-length|content-range|access-control-allow-origin|access-control-expose-headers|cross-origin-resource-policy|vary)' || true
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Check the live deployment (optional)
+        if: ${{ inputs.verify_deployed_url != '' }}
+        continue-on-error: true
+        env:
+          TARGET: ${{ inputs.verify_deployed_url }}
+        run: |
+          set -euo pipefail
+          node scripts/verify-deployed-model.mjs "$TARGET" | tee deployed-report.txt
+          echo '### Deployed check' >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          cat deployed-report.txt >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Compose the report
+        if: always()
+        run: |
+          {
+            echo "## گزارش بررسی مدل — \`${{ github.sha }}\`"
+            echo
+            echo "منبع دانلود: \`https://huggingface.co\` (پیش‌فرض) · ماشین: GitHub runner"
+            echo
+            echo '```json'
+            cat "$REPORT" 2>/dev/null || echo '{}'
+            echo '```'
+            echo
+            echo '```'
+            ls -l public/models/shenava 2>/dev/null || true
+            sha256sum public/models/shenava/* 2>/dev/null || true
+            echo '--- dist ---'
+            ls -l dist/models/shenava 2>/dev/null || echo 'dist/models/shenava empty'
+            echo '```'
+          } > report.md
+          cat report.md
+
+      - name: Post the report
+        if: always() && inputs.report_issue != ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh issue comment "${{ inputs.report_issue }}" --body-file report.md

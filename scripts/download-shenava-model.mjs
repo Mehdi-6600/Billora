@@ -34,7 +34,7 @@
 
 import { createHash } from 'node:crypto'
 import { createReadStream, createWriteStream } from 'node:fs'
-import { copyFile, mkdir, readFile, rename, rm, stat } from 'node:fs/promises'
+import { copyFile, mkdir, readFile, rename, rm, stat, writeFile } from 'node:fs/promises'
 import { isAbsolute, join, resolve } from 'node:path'
 import { Readable } from 'node:stream'
 import { pipeline } from 'node:stream/promises'
@@ -91,7 +91,7 @@ export function formatBytes(bytes) {
 
 export function parseArgs(argv = []) {
   const flags = { check: false, force: false, strict: false, quiet: false }
-  const options = { dir: null, endpoints: [], maxBytes: null }
+  const options = { dir: null, endpoints: [], maxBytes: null, reportPath: null }
   for (const arg of argv) {
     if (arg === '--check') flags.check = true
     else if (arg === '--force') flags.force = true
@@ -100,6 +100,7 @@ export function parseArgs(argv = []) {
     else if (arg.startsWith('--dir=')) options.dir = arg.slice('--dir='.length)
     else if (arg.startsWith('--endpoint=')) options.endpoints.push(arg.slice('--endpoint='.length))
     else if (arg.startsWith('--max-bytes=')) options.maxBytes = Number(arg.slice('--max-bytes='.length))
+    else if (arg.startsWith('--report=')) options.reportPath = arg.slice('--report='.length)
     else if (arg === '--help' || arg === '-h') flags.help = true
     else throw new Error(`unknown argument: ${arg}`)
   }
@@ -221,7 +222,19 @@ export async function runDownload({
   await mkdir(targetDir, { recursive: true })
   if (cacheDir && resolve(cacheDir) !== resolve(targetDir)) await mkdir(cacheDir, { recursive: true })
 
-  const summary = { downloaded: 0, copied: 0, skipped: 0, failed: 0, excluded: 0, errors: [], files: [], bytes: 0 }
+  const summary = {
+    downloaded: 0,
+    copied: 0,
+    skipped: 0,
+    failed: 0,
+    excluded: 0,
+    errors: [],
+    files: [],
+    bytes: 0,
+    /** Per-file details for the build report: bytes, milliseconds, SHA-256, source. */
+    report: [],
+    startedAt: Date.now(),
+  }
 
   for (const spec of files) {
     const targetPath = join(targetDir, spec.name)
@@ -263,6 +276,7 @@ export async function runDownload({
       summary.skipped += 1
       summary.bytes += existing.size
       summary.files.push({ name: spec.name, status: 'skipped', size: existing.size })
+      summary.report.push({ name: spec.name, status: 'skipped', bytes: existing.size, ms: 0, sha256: spec.sha256 })
       logger.log(`OK    ${spec.name} از قبل سالم است (${formatBytes(existing.size)})`)
       continue
     }
@@ -274,6 +288,7 @@ export async function runDownload({
         summary.copied += 1
         summary.bytes += cached.size
         summary.files.push({ name: spec.name, status: 'copied', size: cached.size })
+        summary.report.push({ name: spec.name, status: 'copied', bytes: cached.size, ms: 0, sha256: spec.sha256 })
         logger.log(`CACHE ${spec.name} از کش build کپی شد (${formatBytes(cached.size)})`)
         continue
       }
@@ -288,6 +303,7 @@ export async function runDownload({
     for (const endpoint of endpoints) {
       const url = modelFileUrl(spec.name, { endpoint })
       logger.log(`GET   ${spec.name} (${formatBytes(spec.bytes)}) از ${endpoint}`)
+      const startedAt = Date.now()
       try {
         const { size } = await downloadFile({
           url,
@@ -299,10 +315,12 @@ export async function runDownload({
           sleep,
         })
         if (cachedPath) await copyFile(targetPath, cachedPath).catch(() => undefined)
+        const elapsedMs = Date.now() - startedAt
         summary.downloaded += 1
         summary.bytes += size
         summary.files.push({ name: spec.name, status: 'downloaded', size })
-        logger.log(`OK    ${spec.name} دانلود و تأیید شد (${formatBytes(size)})`)
+        summary.report.push({ name: spec.name, status: 'downloaded', bytes: size, ms: elapsedMs, sha256: spec.sha256, endpoint })
+        logger.log(`OK    ${spec.name} دانلود و تأیید شد (${formatBytes(size)} در ${(elapsedMs / 1000).toFixed(1)} ثانیه)`)
         lastError = null
         break
       } catch (error) {
@@ -350,6 +368,7 @@ export function resolveConfiguration({ argv = process.argv.slice(2), env = proce
     targetDir: resolvePath(options.dir ?? env.SHENAVA_MODEL_DIR ?? DEFAULT_TARGET_DIR, cwd),
     cacheDir: resolvePath(env.SHENAVA_MODEL_CACHE_DIR ?? DEFAULT_CACHE_DIR, cwd),
     manifestPath: resolvePath(env.SHENAVA_MODEL_MANIFEST, cwd),
+    reportPath: resolvePath(options.reportPath ?? env.SHENAVA_MODEL_REPORT, cwd),
   }
 }
 
@@ -362,6 +381,7 @@ const HELP = `نصب مدل گفتار آفلاین شنوا کوچیک ۱.۵ (i
   --strict     در صورت شکست دانلود، build را متوقف کن
   --quiet      کم‌ترین خروجی
   --dir=...    مسیر مقصد (پیش‌فرض public/models/shenava)
+  --report=... نوشتن گزارش JSON (حجم، زمان، SHA-256 هر فایل)
   --endpoint=...  میزبان جایگزین (چند بار قابل تکرار)
 
   متغیرهای محیطی: HF_ENDPOINT، SHENAVA_MODEL_DOWNLOAD، SHENAVA_MODEL_DIR،
@@ -405,6 +425,26 @@ export async function main({ argv = process.argv.slice(2), env = process.env, cw
     `خلاصه: ${summary.downloaded} دانلود، ${summary.copied} از کش، ${summary.skipped} از قبل موجود، ` +
       `${summary.excluded} خارج از build، ${summary.failed} ناموفق`,
   )
+
+  if (config.reportPath) {
+    const report = {
+      generatedAt: new Date().toISOString(),
+      totalMs: Date.now() - summary.startedAt,
+      totalBytes: summary.bytes,
+      endpoints: config.endpoints,
+      counts: {
+        downloaded: summary.downloaded,
+        copied: summary.copied,
+        skipped: summary.skipped,
+        excluded: summary.excluded,
+        failed: summary.failed,
+      },
+      files: summary.report,
+      errors: summary.errors,
+    }
+    await writeFile(config.reportPath, `${JSON.stringify(report, null, 2)}\n`, 'utf8')
+    logger.log(`گزارش نصب مدل نوشته شد: ${config.reportPath}`)
+  }
 
   const shipped = summary.bytes
   if (config.maxBytes === null && shipped > VERCEL_HOBBY_STATIC_LIMIT) {

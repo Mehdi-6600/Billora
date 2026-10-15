@@ -467,6 +467,62 @@ describe('نصب‌کنندهٔ مدل شنوا — خط فرمان (npm run bui
     assert.ok(logger.lines.some((line) => line.includes('GitHub Pages')))
   })
 
+  it('گزارش JSON با حجم، زمان و SHA-256 هر فایل می‌نویسد', async () => {
+    const fixture = await makeFixture({ files: 2 })
+    const server = await startServer(fixture.payloads)
+    cleanups.push(() => server.close(), () => rm(fixture.root, { recursive: true, force: true }))
+    const reportPath = join(fixture.root, 'report.json')
+
+    const code = await main({
+      argv: [`--report=${reportPath}`],
+      env: {
+        SHENAVA_MODEL_DIR: join(fixture.root, 'installed'),
+        SHENAVA_MODEL_CACHE_DIR: join(fixture.root, 'cache'),
+        SHENAVA_MODEL_MANIFEST: fixture.manifestPath,
+        HF_ENDPOINT: server.endpoint,
+      },
+      logger: silentLogger,
+    })
+
+    assert.equal(code, 0)
+    const report = JSON.parse(await readFile(reportPath, 'utf8'))
+    assert.equal(report.files.length, 2)
+    assert.equal(report.counts.downloaded, 2)
+    assert.equal(report.endpoints[0], server.endpoint)
+    for (const file of report.files) {
+      assert.equal(file.status, 'downloaded')
+      assert.equal(file.bytes, 1024)
+      assert.equal(typeof file.ms, 'number')
+      assert.match(file.sha256, /^[0-9a-f]{64}$/)
+      assert.equal(file.endpoint, server.endpoint)
+    }
+    assert.deepEqual(report.errors, [])
+  })
+
+  it('گزارش، فایل‌های از قبل موجود را با زمان صفر ثبت می‌کند', async () => {
+    const fixture = await makeFixture({ files: 1 })
+    const targetDir = join(fixture.root, 'installed')
+    await mkdir(targetDir, { recursive: true })
+    await writeFile(join(targetDir, fixture.manifest[0].name), fixture.payloads.get(fixture.manifest[0].name))
+    cleanups.push(() => rm(fixture.root, { recursive: true, force: true }))
+    const reportPath = join(fixture.root, 'report.json')
+
+    await main({
+      argv: [`--report=${reportPath}`],
+      env: {
+        SHENAVA_MODEL_DIR: targetDir,
+        SHENAVA_MODEL_MANIFEST: fixture.manifestPath,
+        HF_ENDPOINT: 'http://127.0.0.1:1',
+      },
+      logger: silentLogger,
+    })
+
+    const report = JSON.parse(await readFile(reportPath, 'utf8'))
+    assert.equal(report.counts.skipped, 1)
+    assert.equal(report.files[0].status, 'skipped')
+    assert.equal(report.files[0].ms, 0)
+  })
+
   it('از یک سرور محلی (شبیه‌ساز میزبان) کامل نصب می‌کند', async () => {
     const fixture = await makeFixture({ files: 2 })
     const server = await startServer(fixture.payloads)

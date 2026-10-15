@@ -173,9 +173,39 @@ export function resolveShenavaWorkerUrls(context: ShenavaWorkerUrlContext): Shen
 }
 
 export interface ShenavaProbeOptions {
-  /** Also accept the upstream Hugging Face copies (one-time download on first use). */
+  /** Also accept the upstream copies (one-time download on first use). */
   allowRemote?: boolean
+  /** Hugging Face host override (mirrors). */
   hubEndpoint?: string
+  /**
+   * Directory that holds the remote copies, e.g. a GitHub Release asset URL, a Vercel Blob store or
+   * an R2 bucket. When set it replaces Hugging Face as the remote host.
+   */
+  remoteBaseUrl?: string | null
+}
+
+export const SHENAVA_REMOTE_BASE_ENV = 'VITE_SHENAVA_MODEL_BASE_URL'
+
+/**
+ * Remote host configured at build time (`VITE_SHENAVA_MODEL_BASE_URL`), or `null` for Hugging Face.
+ *
+ * This is the escape hatch for host size limits: if the app host refuses to serve the 131 MB
+ * encoder (Vercel's documented 100 MB static-upload limit on the Hobby plan, for example), the
+ * files can live on a GitHub Release, a Vercel Blob store, R2 or any CDN and the app is pointed at
+ * them with this single variable — no code change and no per-user setup.
+ */
+export function configuredRemoteBaseUrl(
+  env: Record<string, unknown> | undefined = import.meta.env as Record<string, unknown> | undefined,
+): string | null {
+  const value = env?.[SHENAVA_REMOTE_BASE_ENV]
+  return typeof value === 'string' && value.trim().length > 0 ? value.trim().replace(/\/+$/, '') : null
+}
+
+/** URL of a model file on the remote host: configured base first, Hugging Face otherwise. */
+export function shenavaRemoteFileUrl(fileName: string, options: ShenavaProbeOptions = {}): string {
+  const base = options.remoteBaseUrl ?? configuredRemoteBaseUrl()
+  if (base) return `${base.replace(/\/+$/, '')}/${fileName}`
+  return shenavaHubUrl(fileName, options.hubEndpoint ?? SHENAVA_HUB_ENDPOINT)
 }
 
 export function shenavaRuntimeSupported(scope: { Worker?: unknown; WebAssembly?: unknown } = globalThis): boolean {
@@ -208,18 +238,26 @@ async function withTimeout<T>(promise: Promise<T>, ms: number): Promise<T> {
 
 type FileState = 'ok' | 'absent' | 'unreachable'
 
+export interface DescribedFile {
+  state: FileState
+  /** `Content-Length` (or the total from `Content-Range`) when the host reported one. */
+  bytes: number | null
+}
+
 /**
  * HEAD first (cheap), then a 1-byte ranged GET for hosts that omit `Content-Length`.
  * A 404/403 means the file is genuinely absent; a thrown/aborted request means the host is down.
  */
-async function describeFile(fetcher: Fetcher, url: string, expectedBytes: number): Promise<FileState> {
+async function describeFile(fetcher: Fetcher, url: string, expectedBytes: number): Promise<DescribedFile> {
   let sawResponse = false
   try {
     const head = await withTimeout(fetcher(url, { method: 'HEAD' }), PROBE_TIMEOUT_MS)
     sawResponse = true
     if (head.ok) {
       const length = Number(head.headers.get('content-length') ?? '')
-      if (Number.isFinite(length) && length > 0) return length === expectedBytes ? 'ok' : 'absent'
+      if (Number.isFinite(length) && length > 0) {
+        return { state: length === expectedBytes ? 'ok' : 'absent', bytes: length }
+      }
     }
   } catch {
     // Fall through to the ranged request below.
@@ -231,24 +269,146 @@ async function describeFile(fetcher: Fetcher, url: string, expectedBytes: number
       PROBE_TIMEOUT_MS,
     )
     sawResponse = true
-    if (!ranged.ok) return 'absent'
+    if (!ranged.ok) return { state: 'absent', bytes: null }
     const contentRange = ranged.headers.get('content-range')
     if (contentRange) {
       const total = Number(contentRange.split('/').pop() ?? '')
-      if (Number.isFinite(total) && total > 0) return total === expectedBytes ? 'ok' : 'absent'
+      if (Number.isFinite(total) && total > 0) {
+        return { state: total === expectedBytes ? 'ok' : 'absent', bytes: total }
+      }
     }
     // Servers that ignore `Range` answer 200; only accept them when the length matches, otherwise
     // an SPA fallback page (Vite dev server, some CDNs) would look like an installed model.
     const length = Number(ranged.headers.get('content-length') ?? '')
-    if (Number.isFinite(length) && length > 0) return length === expectedBytes ? 'ok' : 'absent'
-    return 'absent'
+    if (Number.isFinite(length) && length > 0) {
+      return { state: length === expectedBytes ? 'ok' : 'absent', bytes: length }
+    }
+    return { state: 'absent', bytes: null }
   } catch {
-    return sawResponse ? 'absent' : 'unreachable'
+    return { state: sawResponse ? 'absent' : 'unreachable', bytes: null }
+  }
+}
+
+/** Per-file result of {@link probeShenavaModelFiles}, used by the diagnostic page. */
+export interface ShenavaFileReport {
+  name: string
+  /** Size published in the manifest, in bytes. */
+  expectedBytes: number
+  local: FileState
+  localBytes: number | null
+  remote: FileState | 'not-checked'
+  remoteBytes: number | null
+  /** URL the local probe used. */
+  localUrl: string
+  /** URL of the remote copy that would be used, when remote checks are enabled. */
+  remoteUrl: string | null
+}
+
+export interface ShenavaDetailedAvailability extends ShenavaModelAvailability {
+  files: ShenavaFileReport[]
+}
+
+/**
+ * Full probe: every file is checked next to the app and, when `allowRemote` is set, on the remote
+ * host as well. The engine is available when each file can be loaded from at least one of them.
+ */
+export async function probeShenavaModelFiles(
+  fetcher: Fetcher = globalThis.fetch as unknown as Fetcher,
+  baseUrl = '/',
+  files: readonly ShenavaModelFile[] = SHENAVA_MODEL_FILES,
+  runtimeSupported: boolean = shenavaRuntimeSupported(),
+  probeOptions: ShenavaProbeOptions = {},
+): Promise<ShenavaDetailedAvailability> {
+  if (!runtimeSupported) {
+    return {
+      available: false,
+      missing: files.map((file) => file.name),
+      reason: 'unsupported',
+      files: files.map((file) => ({
+        name: file.name,
+        expectedBytes: file.bytes,
+        local: 'absent' as FileState,
+        localBytes: null,
+        remote: 'not-checked' as const,
+        remoteBytes: null,
+        localUrl: shenavaModelUrl(file.name, baseUrl),
+        remoteUrl: null,
+      })),
+    }
+  }
+
+  const reports: ShenavaFileReport[] = []
+  let unreachableCount = 0
+  let localHits = 0
+
+  for (const file of files) {
+    const localUrl = shenavaModelUrl(file.name, baseUrl)
+    const described = await describeFile(fetcher, localUrl, file.bytes)
+    if (described.state === 'unreachable') unreachableCount += 1
+    if (described.state === 'ok') localHits += 1
+    reports.push({
+      name: file.name,
+      expectedBytes: file.bytes,
+      local: described.state,
+      localBytes: described.bytes,
+      remote: 'not-checked',
+      remoteBytes: null,
+      localUrl,
+      remoteUrl: null,
+    })
+  }
+
+  const localMissing = reports.filter((report) => report.local !== 'ok')
+
+  if (localMissing.length === 0) {
+    return { available: true, missing: [], source: 'local', files: reports }
+  }
+
+  if (!probeOptions.allowRemote) {
+    return {
+      available: false,
+      missing: localMissing.map((report) => report.name),
+      reason: unreachableCount === files.length ? 'unreachable' : 'missing',
+      files: reports,
+    }
+  }
+
+  // A file only counts as lost when it is missing locally AND cannot be fetched remotely, so a
+  // partly shipped model (see SHENAVA_MODEL_MAX_BUILD_BYTES) still gives a working engine.
+  const goneEverywhere: string[] = []
+  const bytesOf = new Map(files.map((file) => [file.name, file.bytes]))
+  let remoteUnreachable = 0
+
+  for (const report of localMissing) {
+    const remoteUrl = shenavaRemoteFileUrl(report.name, probeOptions)
+    report.remoteUrl = remoteUrl
+    const described = await describeFile(fetcher, remoteUrl, bytesOf.get(report.name) ?? report.expectedBytes)
+    report.remote = described.state
+    report.remoteBytes = described.bytes
+    if (described.state === 'ok') continue
+    goneEverywhere.push(report.name)
+    if (described.state === 'unreachable') remoteUnreachable += 1
+  }
+
+  if (goneEverywhere.length === 0) {
+    return {
+      available: true,
+      missing: [],
+      source: localHits > 0 ? 'mixed' : 'hub',
+      files: reports,
+    }
+  }
+
+  return {
+    available: false,
+    missing: goneEverywhere,
+    reason: remoteUnreachable === goneEverywhere.length ? 'unreachable' : 'missing',
+    files: reports,
   }
 }
 
 /**
- * Checks whether the four model files are served from the app itself.
+ * Checks whether the four model files can be loaded (from the app itself or from the remote host).
  * Returns `available: false` when the runtime is unsupported or any file is missing/short.
  */
 export async function probeShenavaModel(
@@ -258,52 +418,12 @@ export async function probeShenavaModel(
   runtimeSupported: boolean = shenavaRuntimeSupported(),
   probeOptions: ShenavaProbeOptions = {},
 ): Promise<ShenavaModelAvailability> {
-  if (!runtimeSupported) {
-    return { available: false, missing: files.map((file) => file.name), reason: 'unsupported' }
-  }
-
-  const missing: string[] = []
-  let unreachableCount = 0
-  let localHits = 0
-
-  for (const file of files) {
-    const state = await describeFile(fetcher, shenavaModelUrl(file.name, baseUrl), file.bytes)
-    if (state === 'unreachable') unreachableCount += 1
-    if (state === 'ok') localHits += 1
-    else missing.push(file.name)
-  }
-
-  if (missing.length === 0) return { available: true, missing: [], source: 'local' }
-
-  if (probeOptions.allowRemote) {
-    // A file only counts as lost when it is missing locally AND cannot be fetched upstream, so a
-    // partly shipped model (see SHENAVA_MODEL_MAX_BUILD_BYTES) still gives a working engine.
-    const goneEverywhere: string[] = []
-    let remoteUnreachable = 0
-    for (const file of files) {
-      if (!missing.includes(file.name)) continue
-      const state = await describeFile(
-        fetcher,
-        shenavaHubUrl(file.name, probeOptions.hubEndpoint ?? SHENAVA_HUB_ENDPOINT),
-        file.bytes,
-      )
-      if (state === 'ok') continue
-      goneEverywhere.push(file.name)
-      if (state === 'unreachable') remoteUnreachable += 1
-    }
-    if (goneEverywhere.length === 0) {
-      return { available: true, missing: [], source: localHits > 0 ? 'mixed' : 'hub' }
-    }
-    return {
-      available: false,
-      missing: goneEverywhere,
-      reason: remoteUnreachable === goneEverywhere.length ? 'unreachable' : 'missing',
-    }
-  }
-
-  return {
-    available: false,
-    missing,
-    reason: unreachableCount === files.length ? 'unreachable' : 'missing',
-  }
+  const { available, missing, reason, source } = await probeShenavaModelFiles(
+    fetcher,
+    baseUrl,
+    files,
+    runtimeSupported,
+    probeOptions,
+  )
+  return { available, missing, ...(reason ? { reason } : {}), ...(source ? { source } : {}) }
 }

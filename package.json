@@ -13,7 +13,8 @@
     "model:download": "node scripts/download-shenava-model.mjs",
     "model:check": "node scripts/download-shenava-model.mjs --check",
     "prebuild": "node scripts/download-shenava-model.mjs",
-    "test:scripts": "node --test scripts/download-shenava-model.test.mjs"
+    "test:scripts": "node --test scripts/*.test.mjs",
+    "verify:deployed": "node scripts/verify-deployed-model.mjs"
   },
   "dependencies": {
     "lucide-react": "^1.57.0",
