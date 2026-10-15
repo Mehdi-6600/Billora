@@ -272,13 +272,15 @@ describe('اتصال موتور آفلاین شنوا به فرم فاکتور',
     expect(commandInput(container).value).toBe('دو عدد دو به فاکتور اضافه کن')
   })
 
-  it('روی اندروید، Web Speech موتور پیش‌فرض می‌ماند و گزینهٔ آفلاین به‌صورت دستی در دسترس است', async () => {
+  it('روی اندروید، Web Speech موتور پیش‌فرض می‌ماند و لینک «استفاده از موتور آفلاین» در دسترس است', async () => {
     setPlatform(ANDROID_UA, 'Linux armv8l', 5)
     const { container, recognizer } = renderEditor({ products: [milk] })
     await flush()
 
-    const toggle = container.querySelector<HTMLButtonElement>('[aria-label="تشخیص گفتار آفلاین روی دستگاه"]')
+    const toggle = Array.from(container.querySelectorAll<HTMLButtonElement>('button'))
+      .find((button) => button.textContent?.includes('موتور آفلاین')) ?? null
     expect(toggle).not.toBeNull()
+    expect(toggle?.className).toContain('engine-switch-link')
     expect(micButton(container).getAttribute('aria-label')).toBe('گفتن دستور با میکروفن')
 
     await clickMic(container)
@@ -291,17 +293,18 @@ describe('اتصال موتور آفلاین شنوا به فرم فاکتور',
     })
     expect(recognizer.init).toHaveBeenCalledTimes(1)
     expect(micButton(container).getAttribute('aria-label')).toBe('توقف ضبط موتور آفلاین')
-    expect(container.querySelector('[aria-label="استفاده از تشخیص گفتار مرورگر"]')).not.toBeNull()
+    const backLink = Array.from(container.querySelectorAll<HTMLButtonElement>('button'))
+      .find((button) => button.textContent?.includes('سرویس مرورگر')) ?? null
+    expect(backLink).not.toBeNull()
   })
 
-  it('اگر مدل آفلاین نصب نباشد، دکمهٔ آفلاین غیرفعال است و پیام «از ورودی متنی استفاده کنید» نمایش داده می‌شود', async () => {
+  it('اگر مدل آفلاین روی آیفون نصب نباشد، دکمهٔ میکروفن پیام «از ورودی متنی استفاده کنید» را نشان می‌دهد', async () => {
     setPlatform(IPHONE_UA, 'iPhone', 5)
     const { container, recognizer } = renderEditor({ modelAvailable: false })
     await flush()
 
-    const disabled = container.querySelector<HTMLButtonElement>('[aria-label="موتور تشخیص گفتار آفلاین در دسترس نیست؛ متن را دستی وارد کنید"]')
-    expect(disabled).not.toBeNull()
-    expect(disabled!.disabled).toBe(true)
+    const mic = micButton(container)
+    expect(mic.disabled).toBe(false)
     expect(offlineNote(container)?.textContent).toContain('از ورودی متنی استفاده کنید')
     expect(offlineNote(container)?.textContent).toContain('encoder.int8.onnx')
 

@@ -50,6 +50,8 @@ export interface OfflineSpeechState {
   crossOriginIsolated: boolean
   /** Where the model bytes come from: the app itself, a one-time download, or a mix of both. */
   modelSource: 'local' | 'hub' | 'mixed' | null
+  /** True once the engine has been initialized at least once this session — subsequent starts are fast. */
+  initializedOnce: boolean
   canStart: boolean
   start: () => void
   stop: () => void
@@ -60,6 +62,11 @@ export interface OfflineSpeechState {
 function isIsolated(): boolean {
   return typeof globalThis.crossOriginIsolated === 'boolean' ? globalThis.crossOriginIsolated : false
 }
+
+// The offline engine is a heavy wasm blob; once it has successfully initialized in this tab, subsequent
+// starts (even after unmounting the editor) are essentially instant. Track this at module scope so the
+// "first load" copy only appears once per page lifetime, not every time the user reopens the editor.
+let engineInitializedThisSession = false
 
 export function useOfflineSpeech(options: OfflineSpeechOptions): OfflineSpeechState {
   const [status, setStatus] = useState<OfflineSpeechStatus>('checking')
@@ -193,8 +200,13 @@ export function useOfflineSpeech(options: OfflineSpeechOptions): OfflineSpeechSt
     const begin = async () => {
       const engine = recognizer()
       if (engine.status !== 'ready') {
-        applyStatus('preparing', OFFLINE_SPEECH_MESSAGES.preparing)
+        // Only show the "first time" warning before the engine has ever finished init this session.
+        // After that, init is instant and the long copy is misleading.
+        applyStatus('preparing', engineInitializedThisSession
+          ? OFFLINE_SPEECH_MESSAGES.preparing
+          : OFFLINE_SPEECH_MESSAGES.preparingFirstTime)
         await engine.init()
+        engineInitializedThisSession = true
       }
       const captureFactory = optionsRef.current.captureFactory ?? createMicCapture
       const capture = await captureFactory({
@@ -258,6 +270,7 @@ export function useOfflineSpeech(options: OfflineSpeechOptions): OfflineSpeechSt
     metrics,
     crossOriginIsolated: isIsolated(),
     modelSource,
+    initializedOnce: engineInitializedThisSession,
     canStart: available === true,
     start,
     stop: handleStop,
