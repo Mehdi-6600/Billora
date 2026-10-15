@@ -51,8 +51,8 @@ describe('گارد دستور: بازنویسی هرگز معنای فرمان �
     expect(itnForCommand(raw, parseCommand)).toBe(raw)
   })
 
-  it('متنی که فرمان شناخته‌شده نیست، بدون تغییر باقی می‌ماند', () => {
-    const raw = 'سلام سه تا نان'
+  it('متنی که فرمان شناخته‌شده نیست (بدون نام کالا) بدون تغییر باقی می‌ماند', () => {
+    const raw = 'همه‌چیز خوب است'
     expect(parseCommand(raw)).toBeNull()
     expect(itnForCommand(raw, parseCommand)).toBe(raw)
   })
