@@ -1,4 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
+import { cmdLog } from '../domain/cmdLog'
 import {
   AlertTriangle,
   ArrowRight,
@@ -172,20 +173,26 @@ export function InvoiceEditorPage({
     setPending(null)
     setTargetPrompt(null)
     setCommandMessage('')
-    if (!commandText.trim()) {
+    const trimmed = commandText.trim()
+    cmdLog('run:click', { input: trimmed, itemsBefore: form.items.length, products: products.length })
+    if (!trimmed) {
+      cmdLog('run:empty')
       setCommandMessage('متنی برای پردازش دریافت نشد. گفتار را دوباره ضبط کنید یا دستور را با صفحه‌کلید وارد کنید.')
       return
     }
-    const command = parseCommand(commandText)
+    const command = parseCommand(trimmed)
+    cmdLog('run:parse', { parsed: command ? JSON.stringify(command) : null })
     if (!command) {
-      // Show the exact text the parser received so a misheard phrase is visible, not hidden as a generic failure.
-      setCommandMessage(`این دستور را نمی‌شناسم: «${commandText.trim()}». از یکی از نمونه‌های پایین استفاده کنید یا نام و عدد را واضح‌تر بنویسید.`)
+      setCommandMessage(`این دستور را نمی‌شناسم: «${trimmed}». از یکی از نمونه‌های پایین استفاده کنید یا نام و عدد را واضح‌تر بنویسید.`)
       return
     }
 
     const plan = planCommand(command, form.items, products)
+    cmdLog('run:plan', { kind: plan.kind, ...(plan.kind === 'addInvoiceItem' ? { name: plan.line.name, qty: plan.line.quantity, fromCatalog: plan.catalogProductFound } : {}) })
     if (plan.kind === 'addInvoiceItem') {
-      onChange({ ...form, items: [...form.items, plan.line] })
+      const nextForm = { ...form, items: [...form.items, plan.line] }
+      cmdLog('run:add:commit', { itemsAfter: nextForm.items.length, newId: plan.line.id })
+      onChange(nextForm)
       setCommandMessage(plan.catalogProductFound
         ? `${formatNumber(command.type === 'addInvoiceItem' ? command.quantity : 0)} ${plan.line.unit} ${plan.line.name} به فاکتور اضافه شد. قیمت و تعداد را بررسی کنید.`
         : `«${plan.line.name}» در فهرست نیست؛ به‌صورت قلم دستی با قیمت صفر اضافه شد. قیمت را پیش از ذخیره بررسی کنید.`)
@@ -194,6 +201,7 @@ export function InvoiceEditorPage({
     }
 
     if (plan.kind === 'setInvoiceQuantity') {
+      cmdLog('run:qty:commit', { lineId: plan.lineId, lineName: plan.lineName, qty: plan.quantity })
       updateLine(plan.lineId, { quantity: String(plan.quantity) })
       setCommandMessage(`تعداد «${plan.lineName}» به ${formatNumber(plan.quantity)} تغییر کرد. برای ثبت دائمی، فاکتور را ذخیره کنید.`)
       setCommandText('')
@@ -201,11 +209,13 @@ export function InvoiceEditorPage({
     }
 
     if (plan.kind === 'error') {
+      cmdLog('run:error', { message: plan.message })
       setCommandMessage(plan.message)
       return
     }
 
     if (plan.kind === 'chooseProduct') {
+      cmdLog('run:choose', { candidates: plan.candidates.map((c) => c.name).join('|') })
       setTargetPrompt({ command: plan.command, candidates: plan.candidates })
       setTargetId('')
       setCommandMessage(command.type === 'deleteProduct' && !command.productName
@@ -214,6 +224,7 @@ export function InvoiceEditorPage({
       return
     }
 
+    cmdLog('run:confirm', { type: plan.action.type, product: plan.action.product.name })
     setPending(plan.action)
     setCommandMessage(plan.matchKind === 'partial'
       ? `نام دقیق پیدا نشد؛ تنها تطبیق «${plan.action.product.name}» است. تغییر پیشنهادی را بررسی و تأیید کنید.`

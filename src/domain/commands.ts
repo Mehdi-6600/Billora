@@ -141,7 +141,7 @@ export function parseCommand(input: string): ParsedCommand | null {
   return null
 }
 
-/** Split "بیست و سه عدد شیر" → qty=23, name="شیر"; null when no quantity is found. */
+/** Split "<qty>[unit] <name>" — e.g. "دو عدد شیر" → qty=2 name="شیر". */
 function splitQuantityAndName(text: string): { quantity: number; name: string } | null {
   const tokens = text.split(/\s+/)
   let i = 0
@@ -149,7 +149,6 @@ function splitQuantityAndName(text: string): { quantity: number; name: string } 
   while (i < tokens.length) {
     const token = tokens[i]!
     if (token === 'و' && i > 0 && i + 1 < tokens.length) {
-      // Only keep «و» if the next token is also a number word.
       const next = tokens[i + 1]!
       if (smallNumberWords[next] !== undefined) { i += 1; continue }
       break
@@ -157,16 +156,42 @@ function splitQuantityAndName(text: string): { quantity: number; name: string } 
     if (smallNumberWords[token] !== undefined || /^\d+(?:\.\d+)?$/.test(token)) { i += 1; continue }
     break
   }
-  if (i === 0) return null
-  const qtyText = tokens.slice(0, i).filter((t) => t !== 'و').join(' ')
-  const quantity = parseCommandNumber(qtyText)
-  if (quantity === null || quantity <= 0) return null
-  // Optional unit word right after the number, then the product name.
-  let rest = tokens.slice(i).join(' ').trim()
-  rest = rest.replace(unitPrefix, '').trim()
-  const productName = unitWords.has(rest) ? '' : cleanProductName(rest)
-  if (!productName) return null
-  return { quantity, name: productName }
+  if (i > 0) {
+    const qtyText = tokens.slice(0, i).filter((t) => t !== 'و').join(' ')
+    const quantity = parseCommandNumber(qtyText)
+    if (quantity !== null && quantity > 0) {
+      let rest = tokens.slice(i).join(' ').trim()
+      rest = rest.replace(unitPrefix, '').trim()
+      const productName = unitWords.has(rest) ? '' : cleanProductName(rest)
+      if (productName) return { quantity, name: productName }
+    }
+  }
+  // Reverse order: "<name> <qty>[unit]" — e.g. "شیر سه عدد" / "شیر 3".
+  let j = tokens.length
+  while (j > 0) {
+    const idx = j - 1
+    const token = tokens[idx]!
+    if (token === 'و' && idx > 0 && idx + 1 < tokens.length) {
+      const prev = tokens[idx - 1]!
+      if (smallNumberWords[prev] !== undefined) { j = idx; continue }
+      break
+    }
+    if (smallNumberWords[token] !== undefined || /^\d+(?:\.\d+)?$/.test(token)) { j = idx; continue }
+    // Optional trailing unit: "شیر ۳ عدد".
+    if (unitWords.has(token) && idx > 0) { j = idx; continue }
+    break
+  }
+  if (j < tokens.length) {
+    const qtyTokens = tokens.slice(j).filter((t) => t !== 'و' && !unitWords.has(t))
+    const qtyText = qtyTokens.join(' ')
+    const quantity = parseCommandNumber(qtyText)
+    if (quantity !== null && quantity > 0) {
+      const rest = tokens.slice(0, j).join(' ').trim()
+      const productName = cleanProductName(rest)
+      if (productName) return { quantity, name: productName }
+    }
+  }
+  return null
 }
 
 function tryParseClean(text: string): ParsedCommand | null {
@@ -194,6 +219,18 @@ function tryParseClean(text: string): ParsedCommand | null {
   if (bareAddMatch) {
     const split = splitQuantityAndName(bareAddMatch[1]!.trim())
     if (split) return { type: 'addInvoiceItem', productName: split.name, quantity: split.quantity }
+  }
+
+  // Short imperative: just "<qty>[unit] <name>" / "<name> <qty>[unit]" — e.g. "دو عدد شیر" / "شیر ۳ عدد".
+  // Matches the most common iPhone pattern where the user only names the item. Refuse if the text
+  // contains keywords that belong to other commands or prepositions from the full-sentence patterns,
+  // otherwise we'd misread "دو عدد به فاکتور اضافه کن" as "add «به» ×2".
+  const nonBareKeywords = /(?:قیمت|حذف|پاک|کنسل|تعداد|درصد|تغییر|عوض|افزایش|کاهش|ذخیره|اضافه|ثبت|وارد|بذار|بزن|بنویس|بنداز|به|توی|روی|تو|در|رو\b|را\b|کن(?:ید)?|بدید|بده)/
+  if (!nonBareKeywords.test(text)) {
+    const bareSplit = splitQuantityAndName(text)
+    if (bareSplit) {
+      return { type: 'addInvoiceItem', productName: bareSplit.name, quantity: bareSplit.quantity }
+    }
   }
 
   const quantityMatch = text.match(/^تعداد\s+(.+?)\s+را\s+به\s+(.+?)\s+(?:تغییر|عوض)\s+(?:بده|بدید|کن|کنید)$/)
