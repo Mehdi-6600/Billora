@@ -20,10 +20,6 @@ name: Shenava model — verify, mirror, report
 
 on:
   workflow_dispatch:
-  # TEMPORARY: lets this workflow be exercised on the feature branch. Removed before merging.
-  push:
-    branches:
-      - arena/d9de851e-billora
     inputs:
       publish_release:
         description: 'مدل را به یک GitHub Release پیوست کن (mirror عمومی)'
