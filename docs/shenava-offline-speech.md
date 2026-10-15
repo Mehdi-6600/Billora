@@ -276,6 +276,8 @@ cdn-lfs.huggingface.co   -> HTTP 000
 
 ### چک‌لیست تست دستی روی گوشی (iPhone Safari / Android Chrome)
 
+> نسخهٔ کوتاه و یک‌صفحه‌ای برای بردن روی گوشی: [`docs/shenava-phone-test.md`](./shenava-phone-test.md)
+
 **۰) آماده‌سازی روی رایانه (یک‌بار)**
 
 ```bash
