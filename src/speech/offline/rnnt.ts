@@ -28,6 +28,12 @@ export interface GreedyDecodeOptions {
   maxSymbolsPerFrame?: number
   /** Subtracted from the blank logit before the arg-max (sherpa-onnx `blank_penalty`). */
   blankPenalty?: number
+  /**
+   * Explicit blank id. NeMo stores the blank token as an extra class after the vocabulary, so the
+   * default (`vocabSize - 1`, the last `tokens.txt` entry) is right for this export; the worker
+   * passes the value the decoder's own metadata declares when it carries one.
+   */
+  blankId?: number
 }
 
 export interface GreedyDecodeResult {
@@ -48,7 +54,10 @@ export async function greedyDecodeNemo(
 ): Promise<GreedyDecodeResult> {
   const vocabSize = runtime.vocabSize
   if (!Number.isInteger(vocabSize) || vocabSize <= 1) throw new Error('vocabSize must be greater than 1')
-  const blankId = vocabSize - 1
+  const blankId = options.blankId ?? vocabSize - 1
+  if (!Number.isInteger(blankId) || blankId < 0 || blankId >= vocabSize) {
+    throw new Error(`blankId ${blankId} is outside the vocabulary (0..${vocabSize - 1})`)
+  }
   const maxSymbolsPerFrame = options.maxSymbolsPerFrame ?? DEFAULT_MAX_SYMBOLS_PER_FRAME
   const blankPenalty = options.blankPenalty ?? 0
   const tokenIds: number[] = []

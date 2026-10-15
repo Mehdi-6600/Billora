@@ -27,6 +27,11 @@ export interface ShenavaEngineInfo {
   hardwareConcurrency: number
   /** Sources the model bytes came from, for diagnostics. */
   sources: Record<string, 'cache' | 'network' | 'hub'>
+  /**
+   * Tensor shapes the transducer runtime feeds, derived from the ONNX signatures of the decoder and
+   * the joiner (e.g. `predictor states context=1(shape) … joiner decoder_outputs[1,640,1]`).
+   */
+  transducerPlan?: string
 }
 
 export type ShenavaWorkerRequest =

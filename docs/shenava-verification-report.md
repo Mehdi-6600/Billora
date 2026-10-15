@@ -114,7 +114,7 @@ Production: https://billora-ai-image-app.vercel.app/test-shenava.html
 | `npm test` | vitest: **۲۳ فایل / ۱۹۵ تست** ✅ · node:test: **۶۷/۶۷** ✅ (۳۶ نصب‌کنندهٔ مدل + ۲۱ ابزار بررسی استقرار + ۱۰ آپلود Blob) |
 | `npm run build` | سبز: خروجی شامل `dist/test-shenava.html`، `dist/assets/shenava.worker-*.js`، `dist/ort-wasm-simd-threaded-*.wasm` |
 | CI `shenava-model.yml` (اجرای `38721480483`) | همهٔ گام‌ها سبز: دانلود، `--check`، اثبات mirror، build و تأیید `dist`، انتشار Release، هدرهای mirror، هدرهای Hugging Face، probe دامنهٔ Production، گزارش Issue |
-| وضعیت PR #9 | Vercel Preview: **pass** · `mergeStateStatus: CLEAN` |
+| وضعیت PR #9 | **merge شد** (کامیت `ccab868`)؛ بررسی Vercel روی شاخه **pass** بود |
 
 دستورهای فاکتور و فرمان فارسی، `src/domain/*`، `src/storage/database.ts` و `index.html` دست‌نخورده‌اند؛ هیچ تستی حذف یا ضعیف نشده است.
 
@@ -132,6 +132,21 @@ Production: https://billora-ai-image-app.vercel.app/test-shenava.html
 
 ## ۵) Production دست‌نخورده
 
-- هیچ merge و هیچ deploy جدیدی انجام نشده است: PR #9 **باز** و merge نشده؛ Production همان `e73f333` قبلی است (که با تأیید صریح کاربر merge شده بود).
+- PR #9 با **دستور صریح کاربر** merge شد (کامیت ادغام `ccab868`، ۱۵ اکتبر ۲۰۲۶ ساعت ۱۱:۳۹ UTC) و Production همان نسخه را با استقرار موفق `7091531945` سرو می‌کند.
+- کارهای بعدی (تقسیم انکودر به تکه‌ها، رفع اشکال شکل تنسورهای RNNT) **هنوز merge و deploy نشده‌اند** و روی شاخهٔ `arena/93559f7f-billora` و در Preview منتظر تأیید شما هستند.
 - هیچ تغییری در `vercel.json`، متغیرهای محیطی Production یا دامنه‌ها انجام نشده است.
 - بازگردانی در صورت لزوم: `SHENAVA_MODEL_DOWNLOAD=0` در Environment Variables → مدل دانلود نمی‌شود، دکمهٔ میکروفن آفلاین غیرفعال می‌ماند، Web Speech و ورودی متنی و «اجرای دستور» مثل قبل کار می‌کنند.
+
+## ۶) به‌روزرسانی — رفع اشکال شکل تنسورهای RNNT (۱۵ اکتبر ۲۰۲۶)
+
+پس از گزارش بالا، اجرای اول روی Chrome با خطای `OrtRun … decoder_outputs … Expected: 640` متوقف شد.
+علت و اصلاح (با امضای واقعی مدل از CI): [`docs/shenava-transducer-fix.md`](./shenava-transducer-fix.md).
+خلاصهٔ شواهد تازه:
+
+- امضای واقعی: `joiner.int8.onnx inputs { encoder_outputs:float32[?,512,?] decoder_outputs:float32[?,640,?] }`
+  ⇒ خوراک درست `[1, 640, 1]` است، نه `[1, 1, 640]`.
+- `context_size` در متادیتای دیکودر وجود ندارد؛ عدد ۶۴۰ همان `pred_hidden` است.
+- در CI، تکه‌های انکودر با همان کد مرورگر به هم چسبیدند (`131342912` بایت، `sha256=b9d975c1…fdd3`) و
+  یک گام پیش‌بین+joiner واقعی اجرا شد (`predictor out=640 · joiner logits=1025 · blank=1024`).
+- اکنون `dist/models/shenava` شامل تکه‌های انکودر + `model-parts.json` است و بزرگ‌ترین فایل منتشرشده
+  زیر ۱۰۰ مگابایت می‌ماند.

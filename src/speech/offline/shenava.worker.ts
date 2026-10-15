@@ -16,7 +16,7 @@ import * as ort from 'onnxruntime-web/wasm'
 import { computeLogMel } from './features'
 import { assembleModelParts } from './modelParts'
 import { readMetadataInt, readOnnxMetadata, type OnnxMetadata } from './onnxMetadata'
-import { greedyDecodeNemo, type NemoTransducerRuntime } from './rnnt'
+import { greedyDecodeNemo } from './rnnt'
 import {
   currentBaseHref,
   SHENAVA_PARTS_FILE,
@@ -28,6 +28,13 @@ import {
   type ShenavaModelFile,
 } from './shenavaModel'
 import { decodeTokens, parseTokens, type TokenTable } from './tokenizer'
+import {
+  createTransducerRuntime,
+  describeTransducerPlan,
+  logSignatures,
+  makeTensor,
+  typedOutput,
+} from './transducerRuntime'
 import type { ShenavaEngineInfo, ShenavaMetrics, ShenavaWorkerRequest, ShenavaWorkerResponse } from './shenavaProtocol'
 
 declare const self: {
@@ -93,8 +100,9 @@ let decoder: ort.InferenceSession | null = null
 let joiner: ort.InferenceSession | null = null
 let tokenTable: TokenTable | null = null
 let info: ShenavaEngineInfo | null = null
-let int64Targets = false
 let int64Lengths = false
+/** `metadata_props` of `decoder.int8.onnx`: NeMo writes `context_size`/`blank_id` there. */
+let decoderMetadata: OnnxMetadata = {}
 
 async function openCache(): Promise<Cache | null> {
   try {
@@ -253,12 +261,6 @@ function tensorDtype(session: ort.InferenceSession, inputName: string): 'int32' 
   }
 }
 
-function makeTensor(values: ArrayLike<number>, dims: readonly number[], dtype: 'int32' | 'int64' | 'float32'): ort.Tensor {
-  if (dtype === 'float32') return new ort.Tensor('float32', Float32Array.from(values), dims)
-  if (dtype === 'int64') return new ort.Tensor('int64', BigInt64Array.from(Array.from(values, (value) => BigInt(value))), dims)
-  return new ort.Tensor('int32', Int32Array.from(values), dims)
-}
-
 /** [1, frames, dim] row-major → [1, dim, frames] (NeMo encoders take channel-first features). */
 function transposeFeatures(features: Float32Array, frames: number, dim: number): Float32Array {
   const out = new Float32Array(frames * dim)
@@ -266,19 +268,6 @@ function transposeFeatures(features: Float32Array, frames: number, dim: number):
     for (let d = 0; d < dim; d += 1) out[d * frames + t] = features[t * dim + d]!
   }
   return out
-}
-
-/** Copies any float view into a plain ArrayBuffer-backed array (keeps TypeScript happy). */
-function copyFloat32(source: ArrayLike<number>): Float32Array {
-  const out = new Float32Array(source.length)
-  out.set(source)
-  return out
-}
-
-function typedOutput(output: ort.Tensor): Float32Array {
-  const data = output.data
-  if (data instanceof Float32Array) return data
-  return Float32Array.from(data as ArrayLike<number>)
 }
 
 async function runEncoder(features: Float32Array, frames: number, dim: number): Promise<{ data: Float32Array; frames: number; dim: number }> {
@@ -321,74 +310,6 @@ async function runEncoder(features: Float32Array, frames: number, dim: number): 
   const lengthsData = lengths.data as ArrayLike<bigint | number>
   const declared = Math.min(encodedFrames, Math.max(1, Number(lengthsData[0] ?? encodedFrames)))
   return { data: rowMajor, frames: declared, dim: channels }
-}
-
-function createTransducerRuntime(encoderDim: number, blankId: number, layers: number, hidden: number): NemoTransducerRuntime {
-  if (!decoder || !joiner) throw new Error('decoder/joiner sessions are not ready')
-  const decoderInputNames = decoder.inputNames
-  const decoderOutputNames = decoder.outputNames
-  const joinerInputNames = joiner.inputNames
-  const joinerOutputNames = joiner.outputNames
-  const vocabSize = blankId + 1
-
-  let stateH: Float32Array = new Float32Array(layers * hidden)
-  let stateC: Float32Array = new Float32Array(layers * hidden)
-  let decoderOut: Float32Array = new Float32Array(hidden)
-
-  async function moveStates(outputs: ort.InferenceSession.OnnxValueMapType): Promise<void> {
-    for (let index = 0; index < decoderOutputNames.length - 2; index += 1) {
-      const tensor = outputs[decoderOutputNames[index + 2]!] as ort.Tensor
-      const flat = typedOutput(tensor)
-      if (index === 0) stateH = copyFloat32(flat)
-      else if (index === 1) stateC = copyFloat32(flat)
-    }
-  }
-
-  async function runPredictor(tokenId: number): Promise<Float32Array> {
-    const targetDtype = int64Targets ? 'int64' : 'int32'
-    const buildFeeds = (dtype: 'int32' | 'int64'): Record<string, ort.Tensor> => ({
-      [decoderInputNames[0]!]: makeTensor([tokenId], [1, 1], dtype),
-      [decoderInputNames[1]!]: makeTensor([1], [1], dtype),
-      [decoderInputNames[2]!]: new ort.Tensor('float32', Float32Array.from(stateH), [layers, 1, hidden]),
-      [decoderInputNames[3]!]: new ort.Tensor('float32', Float32Array.from(stateC), [layers, 1, hidden]),
-    })
-
-    let outputs: ort.InferenceSession.OnnxValueMapType
-    try {
-      outputs = await decoder!.run(buildFeeds(targetDtype))
-    } catch (error) {
-      if (targetDtype === 'int32') {
-        int64Targets = true
-        outputs = await decoder!.run(buildFeeds('int64'))
-      } else {
-        throw error
-      }
-    }
-
-    const out = typedOutput(outputs[decoderOutputNames[0]!] as ort.Tensor)
-    decoderOut = copyFloat32(out.length === hidden ? out : out.subarray(out.length - hidden))
-    await moveStates(outputs)
-    return decoderOut
-  }
-
-  return {
-    vocabSize,
-    async reset() {
-      stateH = new Float32Array(layers * hidden)
-      stateC = new Float32Array(layers * hidden)
-      decoderOut = await runPredictor(blankId)
-    },
-    predict: runPredictor,
-    async join(encoderFrame: Float32Array, currentDecoderOut: Float32Array) {
-      const feeds: Record<string, ort.Tensor> = {
-        [joinerInputNames[0]!]: new ort.Tensor('float32', Float32Array.from(encoderFrame), [1, encoderDim, 1]),
-        [joinerInputNames[1]!]: new ort.Tensor('float32', Float32Array.from(currentDecoderOut), [1, 1, currentDecoderOut.length]),
-      }
-      const outputs = await joiner!.run(feeds)
-      const logits = typedOutput(outputs[joinerOutputNames[0]!] as ort.Tensor)
-      return logits.length > vocabSize ? logits.subarray(logits.length - vocabSize) : logits
-    },
-  }
 }
 
 function numberFromMetadata(metadata: OnnxMetadata, key: string, fallback: number): number {
@@ -449,6 +370,12 @@ async function initialise(request: Extract<ShenavaWorkerRequest, { type: 'init' 
   decoder = await ort.InferenceSession.create(decoderFile.bytes, sessionOptions)
   joiner = await ort.InferenceSession.create(joinerFile.bytes, sessionOptions)
 
+  // ONNX Runtime Web can load a model's `metadata_props`, but the runtime API never exposes them, so
+  // they are read straight from the bytes (NeMo writes `context_size`, `blank_id`, `vocab_size`, …).
+  decoderMetadata = readOnnxMetadata(decoderFile.bytes)
+  logSignatures(decoder, joiner)
+  console.info(`[shenava] decoder.int8.onnx metadata: ${JSON.stringify(decoderMetadata)}`)
+
   const subsamplingFactor = numberFromMetadata(metadata, 'subsampling_factor', 8)
   const predRnnLayers = numberFromMetadata(metadata, 'pred_rnn_layers', 1)
   const predHidden = numberFromMetadata(metadata, 'pred_hidden', 640)
@@ -456,7 +383,17 @@ async function initialise(request: Extract<ShenavaWorkerRequest, { type: 'init' 
   const vocabSize = metadataVocab !== null && metadataVocab > 0 ? metadataVocab + 1 : tokenTable.size
   if (vocabSize < 2) throw new Error('could not determine the vocabulary size from encoder.int8.onnx or tokens.txt')
 
-  const blankId = vocabSize - 1
+  let blankId = vocabSize - 1
+  const metadataBlankId = readMetadataInt(decoderMetadata, 'blank_id') ?? readMetadataInt(decoderMetadata, 'blank_idx')
+  if (metadataBlankId !== null && metadataBlankId >= 0 && metadataBlankId < vocabSize) {
+    if (metadataBlankId !== blankId) {
+      console.warn(
+        `[shenava] decoder metadata says blank_id=${metadataBlankId} but the last token id is ${blankId}; ` +
+          'using the metadata value (it describes how the model was trained).',
+      )
+    }
+    blankId = metadataBlankId
+  }
   if (tokenTable.size !== vocabSize) {
     // sherpa-onnx refuses such files, so report the mismatch instead of decoding nonsense.
     throw new Error(`tokens.txt has ${tokenTable.size} entries but the encoder metadata expects ${vocabSize}`)
@@ -465,7 +402,6 @@ async function initialise(request: Extract<ShenavaWorkerRequest, { type: 'init' 
   const encoderDim = numberFromMetadata(metadata, 'encoder_dim', 512)
 
   int64Lengths = tensorDtype(encoder, encoder.inputNames[1]!) === 'int64'
-  if (decoder.inputNames.length > 0) int64Targets = tensorDtype(decoder, decoder.inputNames[0]!) === 'int64'
 
   info = {
     vocabSize,
@@ -483,6 +419,16 @@ async function initialise(request: Extract<ShenavaWorkerRequest, { type: 'init' 
       'joiner.int8.onnx': joinerFile.source,
       'tokens.txt': tokens.source,
     },
+    // Printed on the diagnostic page: the shapes the runtime will feed, read from the model itself.
+    transducerPlan: describeTransducerPlan({
+      decoder,
+      joiner,
+      encoderDim,
+      blankId,
+      layers: predRnnLayers,
+      hidden: predHidden,
+      decoderMetadata,
+    }),
   }
   return info
 }
@@ -504,18 +450,32 @@ async function transcribe(pcm: Float32Array): Promise<{ text: string; tokenIds: 
   const encoderMs = performance.now() - encoderStart
 
   const decodeStart = performance.now()
-  const runtime = createTransducerRuntime(encoded.dim, info.blankId, info.predRnnLayers, info.predHidden)
-  let firstTokenMs: number | null = null
-  const result = await greedyDecodeNemo(encoded.data, encoded.frames, encoded.dim, {
-    vocabSize: info.vocabSize,
-    reset: runtime.reset,
-    predict: (tokenId: number) => runtime.predict(tokenId),
-    join: async (frame: Float32Array, decoderOut: Float32Array) => {
-      const logits = await runtime.join(frame, decoderOut)
-      if (firstTokenMs === null) firstTokenMs = performance.now() - decodeStart
-      return logits
-    },
+  const runtime = createTransducerRuntime({
+    decoder,
+    joiner,
+    encoderDim: encoded.dim,
+    blankId: info.blankId,
+    layers: info.predRnnLayers,
+    hidden: info.predHidden,
+    decoderMetadata,
   })
+  let firstTokenMs: number | null = null
+  const result = await greedyDecodeNemo(
+    encoded.data,
+    encoded.frames,
+    encoded.dim,
+    {
+      vocabSize: info.vocabSize,
+      reset: runtime.reset,
+      predict: (tokenId: number) => runtime.predict(tokenId),
+      join: async (frame: Float32Array, decoderOut: Float32Array) => {
+        const logits = await runtime.join(frame, decoderOut)
+        if (firstTokenMs === null) firstTokenMs = performance.now() - decodeStart
+        return logits
+      },
+    },
+    { blankId: info.blankId },
+  )
   const decodeMs = performance.now() - decodeStart
 
   const text = decodeTokens(result.tokenIds, tokenTable)

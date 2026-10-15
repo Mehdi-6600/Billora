@@ -75,6 +75,22 @@ jobs:
       - name: Verify sizes and SHA-256 against the app manifest
         run: node scripts/download-shenava-model.mjs --check
 
+      # Runs the *real* decoder/joiner (and the joined encoder) through ONNX Runtime Web — the same
+      # build the browser worker uses — and prints the signatures an `OrtRun` error never shows.
+      - name: Inspect the real ONNX signatures and feed the transducer once
+        continue-on-error: true
+        env:
+          SHENAVA_MODEL_DIR: public/models/shenava
+          SHENAVA_REAL_ENCODER: '1'
+        run: |
+          npx vitest run src/speech/offline/shenavaRealModel.test.ts 2>&1 | tee real-model.txt
+          {
+            echo '### امضا و شکل تنسورهای مدل واقعی'
+            echo '```'
+            cat real-model.txt
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
       - name: Prove the Release mirror serves byte-identical files (build-time fallback)
         if: env.PUBLISH_RELEASE == 'true'
         env:
@@ -286,6 +302,13 @@ jobs:
               echo '### هدرهای Hugging Face (منبع پشتیبان پیش‌فرض موتور)'
               echo '```'
               cat hf-headers.txt
+              echo '```'
+            fi
+            if [ -f real-model.txt ]; then
+              echo
+              echo '### امضای واقعی مدل (decoder/joiner) و یک اجرای واقعی transducer'
+              echo '```'
+              cat real-model.txt
               echo '```'
             fi
             if [ -f mirror-verify.txt ]; then

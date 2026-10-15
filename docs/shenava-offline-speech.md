@@ -220,6 +220,34 @@ BLOB_READ_WRITE_TOKEN=vercel_blob_rw_… npm run upload:model -- --report=blob-r
 
 > صداقت: مسیر شبکهٔ این آپلود تا وقتی این توکن وجود نداشته باشد **آزمایش نشده** است (منطق آدرس‌سازی، بررسی حجم و گزارش‌دهی‌اش تست واحد دارد). اگر Blob هدر CORS نفرستد، همان گام اندازه‌گیری این را نشان می‌دهد و در آن حالت باید Cloudflare R2 یا CDN خودتان با `VITE_SHENAVA_MODEL_BASE_URL` استفاده شود؛ کد سمت برنامه برای هر میزبانی که `<base>/<fileName>` را با هدر CORS بدهد یکی است.
 
+### ۵.۵) امضای واقعی مدل و یک اجرای واقعی transducer (اجرای `38733432134`)
+
+خروجی فایل‌های واقعی (CI، همان runtime مرورگر) — جزئیات در [`docs/shenava-transducer-fix.md`](./shenava-transducer-fix.md):
+
+```
+[real] decoder.int8.onnx inputs { targets:int32[?,?] target_length:int32[?] states.1:float32[1,?,640] onnx::LSTM_3:float32[1,1,640] }
+[real] joiner.int8.onnx inputs { encoder_outputs:float32[?,512,?] decoder_outputs:float32[?,640,?] }
+[real] encoder parts joined: 131342912 B, sha256=b9d975c1af77002f83897017e3adaaa6510148c6ba332df92b8d281369f2fdd3
+[real] predictor out=640 · joiner logits=1025 · blank=1024
+[real] log-mel: frames=51 dim=80 · encoder length dtype: int64 · encoder output: [1, 512, 8]
+[real] greedy decode: 0 token(s) over 8 frame(s)
+```
+
+و در همان اجرا، خروجی build نشان می‌دهد مدل **داخل خود استقرار** است:
+
+```
+--- dist ---
+  67108864 encoder.int8.onnx.part0
+  64234048 encoder.int8.onnx.part1
+   3956194 decoder.int8.onnx
+   1408514 joiner.int8.onnx
+      594 model-parts.json
+     12236 tokens.txt
+بزرگ‌ترین فایل منتشرشده زیر ۱۰۰ مگابایت است ✅
+```
+
+(«۰ توکن» برای یک موج سینوسی مصنوعی طبیعی است؛ هدف این تست اثبات **شکل‌ها** و اجرانشدن خطای `OrtRun` بود.)
+
 ### ۶) گردش‌کار GitHub و ابزار بررسی
 
 | ابزار | کار |
@@ -248,6 +276,8 @@ Cross-Origin-Resource-Policy: same-origin
 | مورد | وضعیت |
 | --- | --- |
 | تست‌های واحد موتور (ویژگی‌ها، توکنایزر، RNNT، ITN، probe، worker، آدرس‌سازی) | ✅ `npm test` |
+| شکل تنسورهای RNNT (۱۷ تست خالص + ۵ تست روی ONNX Runtime واقعی با مدل‌های هم‌امضا) | ✅ `npm test` — خوراک قدیمی با همان پیام دستگاه رد می‌شود و خوراک جدید `decoder_outputs [1, 640, 1]` پذیرفته می‌شود |
+| اجرای مدل واقعی (امضا، جوین‌کردن تکه‌ها، یک گام transducer، یک صدای کوچک) | ✅ در CI اجرای `38733432134` (`shenavaRealModel.test.ts`)؛ محلی بدون مدل skip می‌شود |
 | تست‌های نصب‌کنندهٔ مدل (۲۹ تست با سرور HTTP محلی، شامل mirror و گزارش JSON) | ✅ `npm test` → `node --test scripts/…` |
 | تست‌های ابزار بررسی استقرار (۱۶ تست، شامل تلهٔ پاسخ HTML) | ✅ `npm test` → `node --test scripts/…` |
 | تست‌های آپلود مدل در Blob (۱۰ تست، بدون شبکه) | ✅ `npm test` → `node --test scripts/…` |
@@ -259,6 +289,7 @@ Cross-Origin-Resource-Policy: same-origin
 | مرورگری بودن میزبان‌ها | ✅ Hugging Face (`access-control-allow-origin: *` روی پاسخ نهایی) · ❌ GitHub Release (بدون ACAO) · ❌ jsDelivr (سقف ۲۰ مگابایت برای فایل GitHub) |
 | استقرار روی Vercel (build و خروجی `dist`) | ✅ استقرار موفق. انکودر به‌صورت تکه‌های ۶۴ مگابایتی **همراه build** منتشر می‌شود (زیر سقف ۱۰۰ مگابایتی Hobby)؛ اثبات بیرونی با `curl` همچنان به دیوار ورود Vercel می‌خورد (۳۰۲ به `vercel.com/sso-api`، اندازه‌گیری‌شده) |
 | تقسیم و چسباندن تکه‌ها (end-to-end روی preview محلی) | ✅ `verify:deployed` روی `http://localhost:4173` با مدل نمونه: encoder «۴ تکهٔ هم‌مبدأ» و همهٔ بررسی‌ها PASS |
+| اجرای کامل روی صدای واقعی فارسی (mel → انکودر واقعی → دیکود RNNT → متن) | ✅ در CI (اجرای `38735966441`): ۳۶ توکن معنادار · متن: «می کند یک فاکتور برای آقای رضایی به مبلغ دویست هزار تومان ثبت کن موجودی انبار را هم نشان بده» · جمع ۴۸۶.۵ ms · `decoder_outputs [1, 640, 1]` |
 | اجرای واقعی مدل int8 در مرورگر (با فایل‌های ۱۳۷ مگابایتی) | ❌ انجام نشده — مدل از این محیط دانلود نمی‌شود |
 | تست دستی iPhone Safari / Android Chrome | ❌ انجام نشده (نیازمند دستگاه واقعی) |
 | تست آفلاین‌بودن پس از نصب مدل | ❌ انجام نشده |
@@ -316,6 +347,13 @@ npm run build && npm run preview      # یا: npm run dev
 - جملهٔ تشخیص‌داده‌شده (درست/غلط) و اینکه در حالت پرواز هم کار کرد یا نه
 
 ## رفع اشکال
+
+### خطای `Got invalid dimensions for input: decoder_outputs … Expected: 640`
+
+کامل ماجرا، شواهد و اصلاح: [`docs/shenava-transducer-fix.md`](./shenava-transducer-fix.md). خلاصه: شبکهٔ
+joiner هر دو ورودی را کانال‌اول `(B, D, T)` می‌گیرد، پس `decoder_outputs` باید `[1, 640, 1]` باشد؛ کد
+قبلی `[1, 1, 640]` می‌فرستاد. حالا همهٔ شکل‌ها از `InferenceSession.inputMetadata` خوانده می‌شوند و
+امضاها هم در کنسول و هم در صفحهٔ تشخیص چاپ می‌شوند.
 
 - **خطای `Invalid base URL` یا «آدرس قابل تجزیه نیست»**: هیچ آدرسی نباید نسبت به یک مسیر نسبی حل شود. `resolveShenavaWorkerUrls()` را ببینید؛ ورودی‌اش `baseHref` مطلق (`location.href`) است.
 - **`crossOriginIsolated === false`**: هدرهای COOP/COEP را در همان میزبان بررسی کنید (`curl -I`). در توسعه، سرور Vite خودش این هدرها را می‌فرستد.
