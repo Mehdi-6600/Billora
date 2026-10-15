@@ -19,8 +19,6 @@ name: Shenava model — verify, mirror, report
 #      gh workflow run shenava-model.yml -f publish_release=true -f verify_deployed_url=https://…
 
 on:
-  push:
-    branches: ['arena/93559f7f-billora']
   workflow_dispatch:
     inputs:
       publish_release:
