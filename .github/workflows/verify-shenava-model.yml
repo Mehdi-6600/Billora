@@ -10,6 +10,10 @@ name: Verify offline model download
 
 on:
   workflow_dispatch:
+  # Temporary trigger while this workflow is verified on its own branch; removed before merge.
+  push:
+    branches:
+      - arena/5e7068da-billora
 
 permissions:
   contents: read
