@@ -51,6 +51,12 @@ jobs:
     runs-on: ubuntu-latest
     env:
       REPORT: model-report.json
+      # `github.event.inputs` is empty for push runs, so the defaults are spelled out here and both
+      # triggers (manual dispatch and the temporary branch trigger) behave identically.
+      PUBLISH_RELEASE: ${{ github.event.inputs.publish_release || 'true' }}
+      RELEASE_TAG: ${{ github.event.inputs.release_tag || 'shenava-model-v1.5-int8' }}
+      VERIFY_URL: ${{ github.event.inputs.verify_deployed_url || '' }}
+      REPORT_ISSUE: ${{ github.event.inputs.report_issue || '8' }}
     steps:
       - name: Check out source
         uses: actions/checkout@v4
@@ -82,10 +88,10 @@ jobs:
           ls -l dist/models/shenava
 
       - name: Publish the model as a release mirror
-        if: ${{ inputs.publish_release }}
+        if: env.PUBLISH_RELEASE == 'true'
         env:
           GH_TOKEN: ${{ github.token }}
-          TAG: ${{ inputs.release_tag }}
+          TAG: ${{ env.RELEASE_TAG }}
         run: |
           set -euo pipefail
           gh release view "$TAG" >/dev/null 2>&1 || gh release create "$TAG" \
@@ -94,9 +100,9 @@ jobs:
           gh release upload "$TAG" public/models/shenava/* --clobber
 
       - name: Measure the mirror's HTTP headers (browser CORS requirements)
-        if: ${{ inputs.publish_release }}
+        if: env.PUBLISH_RELEASE == 'true'
         env:
-          TAG: ${{ inputs.release_tag }}
+          TAG: ${{ env.RELEASE_TAG }}
         run: |
           set -euo pipefail
           URL="https://github.com/${{ github.repository }}/releases/download/$TAG/encoder.int8.onnx"
@@ -110,10 +116,10 @@ jobs:
           } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Check the live deployment (optional)
-        if: ${{ inputs.verify_deployed_url != '' }}
+        if: env.VERIFY_URL != ''
         continue-on-error: true
         env:
-          TARGET: ${{ inputs.verify_deployed_url }}
+          TARGET: ${{ env.VERIFY_URL }}
         run: |
           set -euo pipefail
           node scripts/verify-deployed-model.mjs "$TARGET" | tee deployed-report.txt
@@ -144,7 +150,7 @@ jobs:
           cat report.md
 
       - name: Post the report
-        if: always() && inputs.report_issue != ''
+        if: always() && env.REPORT_ISSUE != ''
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh issue comment "${{ inputs.report_issue }}" --body-file report.md
+        run: gh issue comment "$REPORT_ISSUE" --body-file report.md
