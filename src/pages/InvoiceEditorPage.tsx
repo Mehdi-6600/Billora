@@ -17,8 +17,8 @@ import {
   X,
 } from 'lucide-react'
 import { calculateInvoiceTotals, calculateLineAmounts, formatNumber, formatToman, parseLocalizedNumber } from '../domain/calculations'
-import { normalizeProductName, parseCommand, supportedCommandExamples, type ParsedCommand } from '../domain/commands'
-import { planCommand, productConfirmation, type ProductCommandAction } from '../domain/command-execution'
+import { normalizeProductName, parseCommand, parseSpeechText, parseSpokenItems, supportedCommandExamples, type ParsedCommand, type SpokenItemEntry } from '../domain/commands'
+import { planCommand, planSpokenItems, productConfirmation, type PlannedSpokenLine, type ProductCommandAction, type SpokenItemIssue } from '../domain/command-execution'
 import { PersianSpeechSession, getSpeechRecognitionConstructor, type SpeechStatus } from '../domain/speech-recognition'
 import { resolveActiveEngine, detectIosLike, type SpeechEnginePreference } from '../speech/offline/engineSelection'
 import { OFFLINE_SPEECH_MESSAGES } from '../speech/offline/offlineSpeechMessages'
@@ -56,6 +56,13 @@ type PendingAction = ProductCommandAction
 
 type TargetPrompt = { command: ParsedCommand; candidates: Product[] }
 
+/** Ambiguous spoken items kept on screen so the user can correct the text — nothing is registered. */
+type ItemReview = {
+  entries: SpokenItemEntry[]
+  planned: PlannedSpokenLine[]
+  issues: SpokenItemIssue[]
+}
+
 export function InvoiceEditorPage({
   form,
   products,
@@ -89,6 +96,7 @@ export function InvoiceEditorPage({
   const [pending, setPending] = useState<PendingAction | null>(null)
   const [targetPrompt, setTargetPrompt] = useState<TargetPrompt | null>(null)
   const [targetId, setTargetId] = useState('')
+  const [itemReview, setItemReview] = useState<ItemReview | null>(null)
   const [speechStatus, setSpeechStatus] = useState<SpeechStatus>('idle')
   const [webSpeechServiceUnavailable, setWebSpeechServiceUnavailable] = useState(false)
   const [enginePreference, setEnginePreference] = useState<SpeechEnginePreference>('auto')
@@ -106,7 +114,7 @@ export function InvoiceEditorPage({
       setCommandText(transcript)
       setCommandMessage(OFFLINE_SPEECH_MESSAGES.done)
     },
-    transformTranscript: offlineSpeech?.transformTranscript ?? ((transcript) => itnForCommand(transcript, parseCommand)),
+    transformTranscript: offlineSpeech?.transformTranscript ?? ((transcript) => itnForCommand(transcript, parseSpeechText)),
   })
 
   useEffect(() => {
@@ -172,6 +180,7 @@ export function InvoiceEditorPage({
   const runCommand = () => {
     setPending(null)
     setTargetPrompt(null)
+    setItemReview(null)
     setCommandMessage('')
     const trimmed = commandText.trim()
     cmdLog('run:click', { input: trimmed, itemsBefore: form.items.length, products: products.length })
@@ -182,9 +191,44 @@ export function InvoiceEditorPage({
     }
     const command = parseCommand(trimmed)
     cmdLog('run:parse', { parsed: command ? JSON.stringify(command) : null })
-    if (!command) {
-      setCommandMessage(`این دستور را نمی‌شناسم: «${trimmed}». از یکی از نمونه‌های پایین استفاده کنید یا نام و عدد را واضح‌تر بنویسید.`)
-      return
+
+    // Spoken item lists («دو تا لنت …، چهار تا لاستیک …، یک جفت چراغ …») are the add-item
+    // path: one or more items with quantity / spoken price. They may not parse as a single
+    // command, so try them before the single-command plan below.
+    if (!command || command.type === 'addInvoiceItem') {
+      const list = parseSpokenItems(trimmed)
+      if (list) {
+        const itemPlan = planSpokenItems(list.items, products)
+        cmdLog('run:items', { count: list.items.length, issues: itemPlan.issues.length })
+        if (itemPlan.issues.length > 0) {
+          // Ambiguous items are shown for correction; nothing is guessed, nothing is registered.
+          cmdLog('run:items:review', { issues: itemPlan.issues.map((issue) => issue.raw).join('|') })
+          setItemReview({ entries: list.items, planned: itemPlan.planned, issues: itemPlan.issues })
+          setCommandMessage('چیزی ثبت نشد؛ بخش‌های مبهم را اصلاح کنید و دوباره «ثبت» را بزنید.')
+          return
+        }
+        const lines = itemPlan.planned.map((entry) => entry.line)
+        const nextForm = { ...form, items: [...form.items, ...lines] }
+        cmdLog('run:items:commit', { itemsAfter: nextForm.items.length, count: lines.length })
+        onChange(nextForm)
+        const parts = itemPlan.planned.map((entry) => {
+          const quantity = parseLocalizedNumber(entry.line.quantity) ?? 0
+          const unitPrice = parseLocalizedNumber(entry.line.unitPrice) ?? 0
+          return `${formatNumber(quantity)} ${entry.line.unit} ${entry.line.name} — قیمت واحد ${formatToman(unitPrice)}`
+        })
+        const addedSum = itemPlan.planned.reduce((sum, entry) => {
+          const quantity = parseLocalizedNumber(entry.line.quantity) ?? 0
+          const unitPrice = parseLocalizedNumber(entry.line.unitPrice) ?? 0
+          return sum + quantity * unitPrice
+        }, 0)
+        setCommandMessage(`${formatNumber(lines.length)} قلم در فاکتور ثبت شد: ${parts.join('؛ ')}. جمع مبلغ این اقلام: ${formatToman(addedSum)}.`)
+        setCommandText('')
+        return
+      }
+      if (!command) {
+        setCommandMessage(`این دستور را نمی‌شناسم: «${trimmed}». از یکی از نمونه‌های پایین استفاده کنید یا نام و عدد را واضح‌تر بنویسید.`)
+        return
+      }
     }
 
     const plan = planCommand(command, form.items, products)
@@ -453,9 +497,9 @@ export function InvoiceEditorPage({
       <section className="command-panel panel">
         <div className="command-heading"><span className="command-heading-icon"><Sparkles size={18} /></span><div><span className="panel-kicker">پردازش محلی · بدون API هوش مصنوعی</span><h2>دستور متنی فارسی</h2><p>برای فاکتور یا فهرست محصولات، یکی از دستورهای مشخص را بنویسید.</p></div></div>
         <div className="command-input-row">
-          <input value={commandText} onChange={(event) => { setCommandText(event.target.value); setCommandMessage('') }} onKeyDown={(event) => { if (event.key === 'Enter' && !event.shiftKey) { event.preventDefault(); runCommand() } }} placeholder="مثلاً: سه عدد شیر به فاکتور اضافه کن" aria-label="نوشتن دستور فارسی" enterKeyHint="send" />
+          <input value={commandText} onChange={(event) => { setCommandText(event.target.value); setCommandMessage(''); setItemReview(null) }} onKeyDown={(event) => { if (event.key === 'Enter' && !event.shiftKey) { event.preventDefault(); runCommand() } }} placeholder="مثلاً: سه عدد شیر به فاکتور اضافه کن" aria-label="نوشتن دستور فارسی" enterKeyHint="send" />
           <button type="button" className={`voice-button${offlineActive ? ' offline-voice-button' : ''}${micButtonListening ? ' listening' : ''}${micButtonError ? ' speech-error' : ''}${micButtonComplete ? ' speech-complete' : ''}`} onClick={handleMicClick} disabled={micButtonDisabled} aria-label={micButtonLabel} title={offlineActive ? 'دکمهٔ میکروفن — گفتار روی همین دستگاه پردازش می‌شود' : 'دکمهٔ میکروفن — گفتار با سرویس مرورگر پردازش می‌شود'}>{micButtonBusy ? <MicOff size={17} /> : micButtonComplete ? <Check size={17} /> : <Mic size={17} />}<span>{micButtonText}</span></button>
-          <button type="button" className="button button-primary command-run" onClick={runCommand}>اجرای دستور</button>
+          <button type="button" className="button button-primary command-run" title="اجرای دستور" onClick={runCommand}>ثبت</button>
         </div>
         <div className="command-meta-row">
           {offlineActive
@@ -475,9 +519,24 @@ export function InvoiceEditorPage({
         </div>
         {offlineNoteVisible && <div className="offline-engine-note" aria-live="polite"><CircleHelp size={14} />{offline.message || OFFLINE_SPEECH_MESSAGES.modelMissing}</div>}
         <p className="voice-disclaimer">{offlineActive
-          ? 'صدا روی همین دستگاه پردازش می‌شود و به اینترنت فرستاده نمی‌شود. متن شنیده‌شده خودکار اجرا نمی‌شود و قبل از «اجرای دستور» قابل ویرایش است.'
+          ? 'صدا روی همین دستگاه پردازش می‌شود و به اینترنت فرستاده نمی‌شود. متن شنیده‌شده خودکار اجرا نمی‌شود و قبل از «ثبت» قابل ویرایش است.'
           : 'تشخیص گفتار با سرویس گفتار مرورگر انجام می‌شود؛ ممکن است به اینترنت نیاز داشته باشد. متن شنیده‌شده خودکار اجرا نمی‌شود.'}</p>
         {commandMessage && <div className="command-feedback" role="status"><CircleHelp size={16} />{commandMessage}</div>}
+        {itemReview && (
+          <div className="command-confirmation is-danger" role="alert">
+            <span className="confirm-icon"><AlertTriangle size={18} /></span>
+            <div className="confirm-copy">
+              <strong>این موارد روشن نیستند؛ متن را اصلاح کنید و دوباره «ثبت» را بزنید (چیزی ثبت نشده است):</strong>
+              {itemReview.issues.map((issue, index) => (
+                <span key={`issue-${index}`}>نیاز به اصلاح: «{issue.raw}» — {issue.reason}</span>
+              ))}
+              {itemReview.planned.map((entry) => (
+                <span key={entry.line.id}>آماده برای ثبت: «{entry.raw}» — {formatNumber(parseLocalizedNumber(entry.line.quantity) ?? 0)} {entry.line.unit} {entry.line.name} · قیمت واحد {formatToman(parseLocalizedNumber(entry.line.unitPrice) ?? 0)}</span>
+              ))}
+            </div>
+            <button type="button" className="icon-button" aria-label="بستن بازبینی اقلام" onClick={() => setItemReview(null)}><X size={17} /></button>
+          </div>
+        )}
         <div className="command-examples"><span>نمونه‌ها:</span>{supportedCommandExamples.map((example) => <button type="button" key={example} onClick={() => { setCommandText(example); setCommandMessage('') }}>{example}</button>)}</div>
 
         {targetPrompt && (
