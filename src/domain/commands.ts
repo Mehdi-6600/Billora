@@ -256,3 +256,370 @@ export const supportedCommandExamples = [
   'تعداد برنج را به دو تغییر بده',
   'محصول روغن را حذف کن',
 ] as const
+
+// ---------------------------------------------------------------------------
+// Spoken item lists — «دو تا لنت ترمز پراید، چهار تا لاستیک دنا سمند، یک جفت چراغ …»
+//
+// The single-command parser above cannot describe a shopping sentence with several
+// items, prices per item, or the pair unit «جفت». These helpers parse exactly that
+// shape: items separated by «،» / «و» / «، و», each with a quantity (words, Persian
+// digits or Arabic digits), an optional unit («تا»، «عدد»، «جفت» = 2، …) and an
+// optional spoken price. Anything unclear becomes a `review` entry that the UI must
+// show to the user instead of guessing and registering it.
+// ---------------------------------------------------------------------------
+
+export type SpokenItemEntry =
+  | {
+      status: 'ok'
+      raw: string
+      productName: string
+      quantity: number
+      /** Real unit word («کیسه»، «بسته»، …) or `null` for counters like «تا» / «جفت». */
+      unit: string | null
+      /** Unit price in toman when the user said it; `null` means "use the catalog price". */
+      unitPrice: number | null
+    }
+  | { status: 'review'; raw: string; reason: string }
+
+export interface SpokenItemList {
+  items: SpokenItemEntry[]
+}
+
+/** «جفت» multiplies the count: «یک جفت چراغ» = 2 چراغ. */
+const UNIT_MULTIPLIERS: Record<string, number> = { جفت: 2 }
+const SPOKEN_SCALES = new Set(['هزار', 'میلیون', 'میلیارد'])
+const PRICE_MARKERS = new Set(['قیمت', 'قیمتش', 'قیمته', 'قیمتی', 'عددی'])
+const CURRENCY_WORDS = new Set(['تومان', 'تومن'])
+
+const REVIEW_NO_QUANTITY = 'تعداد این قلم معلوم نیست؛ تعداد را در متن بگویید (مثلاً «دو تا …»).'
+const REVIEW_NO_NAME = 'نام کالا در این قلم معلوم نیست.'
+const REVIEW_BAD_PRICE = 'قیمت گفته‌شده برای این قلم نامعتبر است. قیمت را عددی بنویسید (مثلاً «به قیمت ۲۵۰۰۰۰»).'
+
+function isNumberToken(token: string): boolean {
+  if (smallNumberWords[token] !== undefined || SPOKEN_SCALES.has(token)) return true
+  if (/^\d+(?:\.\d+)?$/.test(token)) return true
+  // Hundreds («دویست»، «پانصد»، …) and their colloquial variants live in the spoken-number
+  // tables, not in `smallNumberWords`; ask the shared parser so runs stay unbroken.
+  return parseSpokenNumber([token]) !== null
+}
+
+function isUnitToken(token: string): boolean {
+  return unitWords.has(token) || token in UNIT_MULTIPLIERS
+}
+
+/** Like `normalizeCommand`, but keeps «،» / commas so items stay separable. */
+function normalizeListText(value: string): string {
+  return normalizeDigits(value)
+    .toLocaleLowerCase('fa-IR')
+    .replace(/[يى]/g, 'ی')
+    .replace(/ك/g, 'ک')
+    .replace(/[\u064b-\u065f\u0670]/g, '')
+    .replace(/[\u200c\u200f\u200e]/g, ' ')
+    // Thousands separators between digits are not item separators: «۲۵۰٬۰۰۰» → «۲۵۰۰۰۰».
+    .replace(/(?<=\d)[,،٬](?=\d)/g, '')
+    .replace(/[؛;.!?؟:]+/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim()
+}
+
+const LIST_TRAILING_IMPERATIVES = [
+  /\s+(?:را|رو)?\s*(?:به|توی|تو|در|روی)\s+فاکتور(?:م)?\s+(?:اضافه|اضافهه|ثبت|وارد|بذار|بزن|بنویس|بنداز|افزودن)\s*(?:کن(?:ید|ین|یم)?|بده(?:ید)?|بذار(?:ید)?)?$/,
+  /\s+(?:را|رو)\s+(?:به|توی|تو|در|روی)?\s*فاکتور(?:م)?\s*(?:اضافه|اضافهه|ثبت|وارد|بذار|بزن|بنویس|بنداز|افزودن)?\s*(?:کن(?:ید|ین|یم)?|بده(?:ید)?)?$/,
+  /\s+(?:را|رو)?\s*(?:اضافه|اضافهه|ثبت|وارد|بذار|بزن|بنویس|بنداز|افزودن)\s+(?:کن(?:ید|ین|یم)?|بده(?:ید)?|بذار(?:ید)?)$/,
+  /\s+(?:را|رو)\s+(?:ثبت|بزن|اضافه)$/,
+  /\s+(?:ثبت|بزن)$/,
+]
+
+function stripListImperatives(value: string): string {
+  let text = value
+  let prev = ''
+  for (let i = 0; i < 3 && text !== prev; i += 1) {
+    prev = text
+    for (const pattern of LIST_TRAILING_IMPERATIVES) {
+      text = text.replace(pattern, '').trim()
+    }
+  }
+  return text
+}
+
+/** Split on «،» (and ASCII commas). A following «و» (the «، و» form) is dropped too. */
+function splitListSegments(text: string): string[] {
+  return text
+    .split(/[،,]/)
+    .map((segment) => segment.replace(/^و\s+/, '').replace(/\s+و$/, '').trim())
+    .filter((segment) => segment.length > 0)
+}
+
+interface SegmentParse {
+  entry: SpokenItemEntry
+  /** Quantity structure or an explicit price phrase was seen — this is really an item, not chat. */
+  signal: boolean
+  hasQuantity: boolean
+}
+
+interface PriceExtraction {
+  price: number | null
+  error: string | null
+  restTokens: string[]
+  /** An explicit price phrase («قیمت»/«هر کدام»/«تومان») was present. */
+  markerFound: boolean
+}
+
+function parsePriceValue(text: string): number | null {
+  const cleaned = normalizeDigits(text).replace(/[،,٬]/g, '').replace(/\s+/g, ' ').trim()
+  if (!cleaned) return null
+  const value = parseCommandNumber(cleaned)
+  return value !== null && Number.isSafeInteger(value) && value > 0 ? value : null
+}
+
+function extractPrice(tokens: string[]): PriceExtraction {
+  const work = [...tokens]
+  let sawCurrency = false
+  while (work.length > 0 && CURRENCY_WORDS.has(work[work.length - 1]!)) {
+    work.pop()
+    sawCurrency = true
+  }
+
+  // Explicit markers: «قیمت …» / «عددی …» / «هر کدام …». Scan from the end so the last
+  // price phrase wins («به قیمت …» after a name).
+  let markerIndex = -1
+  let afterMarker = -1
+  for (let i = work.length - 1; i >= 0; i -= 1) {
+    const token = work[i]!
+    if (PRICE_MARKERS.has(token)) {
+      markerIndex = i
+      afterMarker = i + 1
+      if (work[afterMarker] === 'هر' && (work[afterMarker + 1] === 'کدام' || work[afterMarker + 1] === 'عدد' || work[afterMarker + 1] === 'دانه')) {
+        afterMarker += 2
+      } else if (work[afterMarker] === 'هرکدام') {
+        afterMarker += 1
+      }
+      break
+    }
+    if (token === 'هرکدام' || (token === 'هر' && work[i + 1] === 'کدام')) {
+      markerIndex = i
+      afterMarker = token === 'هر' ? i + 2 : i + 1
+      break
+    }
+  }
+
+  if (markerIndex >= 0) {
+    const priceTokens = work.slice(afterMarker)
+    const restTokens = work.slice(0, markerIndex)
+    while (restTokens.length > 0 && (restTokens[restTokens.length - 1] === 'به' || restTokens[restTokens.length - 1] === 'با')) {
+      restTokens.pop()
+    }
+    const price = parsePriceValue(priceTokens.join(' '))
+    if (price === null) return { price: null, error: REVIEW_BAD_PRICE, restTokens: work, markerFound: true }
+    return { price, error: null, restTokens, markerFound: true }
+  }
+
+  if (sawCurrency) {
+    // «… صد و بیست هزار تومان» — take the longest trailing run of number words/digits.
+    let start = work.length
+    while (start > 0 && isNumberToken(work[start - 1]!)) start -= 1
+    const priceTokens = work.slice(start)
+    // A «و» between two number words is part of the number run («صد و بیست»).
+    while (start > 0 && work[start - 1] === 'و' && start >= 2 && isNumberToken(work[start - 2]!)) {
+      start -= 1
+      priceTokens.unshift('و')
+    }
+    const price = parsePriceValue(priceTokens.join(' '))
+    if (price === null) return { price: null, error: REVIEW_BAD_PRICE, restTokens: work, markerFound: true }
+    return { price, error: null, restTokens: work.slice(0, start), markerFound: true }
+  }
+
+  return { price: null, error: null, restTokens: work, markerFound: false }
+}
+
+interface QuantityLead {
+  quantity: number
+  unit: string | null
+  nameTokens: string[]
+}
+
+function quantityFromStart(tokens: string[]): QuantityLead | null {
+  if (tokens.length === 0) return null
+  if (tokens[0] === 'جفت') return { quantity: 2, unit: null, nameTokens: tokens.slice(1) }
+
+  let index = 0
+  const run: string[] = []
+  while (index < tokens.length) {
+    const token = tokens[index]!
+    if (token === 'و' && run.length > 0 && index + 1 < tokens.length && isNumberToken(tokens[index + 1]!)) {
+      run.push(token)
+      index += 1
+      continue
+    }
+    if (isNumberToken(token)) {
+      run.push(token)
+      index += 1
+      continue
+    }
+    break
+  }
+  if (run.length === 0) return null
+  const parsed = parseCommandNumber(run.join(' '))
+  if (parsed === null || parsed <= 0) return null
+
+  let quantity = parsed
+  let unit: string | null = null
+  if (index < tokens.length && isUnitToken(tokens[index]!)) {
+    const marker = tokens[index]!
+    index += 1
+    const multiplier = UNIT_MULTIPLIERS[marker]
+    if (multiplier) quantity *= multiplier
+    else if (marker !== 'تا') unit = marker
+  }
+  return { quantity, unit, nameTokens: tokens.slice(index) }
+}
+
+/**
+ * Reverse order («شیر سه عدد»). A trailing count is only accepted next to a unit word,
+ * so product names that end in digits («چراغ خطر پژو ۴۰۵») are never eaten as a quantity.
+ */
+function quantityFromEnd(tokens: string[]): QuantityLead | null {
+  if (tokens.length < 2) return null
+  const last = tokens[tokens.length - 1]!
+  if (!isUnitToken(last)) return null
+
+  let index = tokens.length - 2
+  const run: string[] = []
+  while (index >= 0) {
+    const token = tokens[index]!
+    if (token === 'و' && run.length > 0 && index - 1 >= 0 && isNumberToken(tokens[index - 1]!)) {
+      run.unshift(token)
+      index -= 1
+      continue
+    }
+    if (isNumberToken(token)) {
+      run.unshift(token)
+      index -= 1
+      continue
+    }
+    break
+  }
+  if (run.length === 0) return null
+  const parsed = parseCommandNumber(run.join(' '))
+  if (parsed === null || parsed <= 0) return null
+
+  const multiplier = UNIT_MULTIPLIERS[last]
+  return {
+    quantity: multiplier ? parsed * multiplier : parsed,
+    unit: multiplier || last === 'تا' ? null : last,
+    nameTokens: tokens.slice(0, index + 1),
+  }
+}
+
+function cleanItemName(tokens: string[]): string {
+  let name = tokens.join(' ').trim()
+  name = name.replace(/\s+(?:به|با)$/, '')
+  name = name.replace(/\s+را$/, '')
+  return cleanProductName(name)
+}
+
+function parseItemSegment(segment: string): SegmentParse {
+  const raw = segment.trim()
+  const tokens = raw.split(/\s+/).filter(Boolean)
+  const price = extractPrice(tokens)
+  if (price.error) {
+    return { entry: { status: 'review', raw, reason: price.error }, signal: true, hasQuantity: false }
+  }
+
+  const lead = quantityFromStart(price.restTokens) ?? quantityFromEnd(price.restTokens)
+  const signal = Boolean(lead) || price.markerFound
+  if (!lead) {
+    return { entry: { status: 'review', raw, reason: REVIEW_NO_QUANTITY }, signal, hasQuantity: false }
+  }
+  const productName = cleanItemName(lead.nameTokens)
+  if (!productName) {
+    return { entry: { status: 'review', raw, reason: REVIEW_NO_NAME }, signal, hasQuantity: true }
+  }
+  return {
+    entry: {
+      status: 'ok',
+      raw,
+      productName,
+      quantity: lead.quantity,
+      unit: lead.unit,
+      unitPrice: price.price,
+    },
+    signal,
+    hasQuantity: true,
+  }
+}
+
+/**
+ * Split one comma-segment on bare «و» between items («دو تا لنت و چهار تا لاستیک»).
+ * A «و» between two number words belongs to the number («بیست و سه»)، and the split is
+ * only accepted when every part can stand alone as an item; otherwise «و» stays inside
+ * the product name («دو تا روغن و فیلتر»). This keeps prices like «صد و بیست هزار» whole.
+ */
+function splitOnConnectors(segment: string): string[] {
+  const tokens = segment.split(/\s+/).filter(Boolean)
+  const cutPoints: number[] = []
+  for (let i = 1; i < tokens.length - 1; i += 1) {
+    if (tokens[i] !== 'و') continue
+    const prev = tokens[i - 1]!
+    const next = tokens[i + 1]!
+    if (isNumberToken(prev) && isNumberToken(next)) continue
+    cutPoints.push(i)
+  }
+  if (cutPoints.length === 0) return [segment]
+
+  const parts: string[] = []
+  let start = 0
+  for (const point of cutPoints) {
+    parts.push(tokens.slice(start, point).join(' '))
+    start = point + 1
+  }
+  parts.push(tokens.slice(start).join(' '))
+
+  const everyPartStandsAlone = parts.every((part) => parseItemSegment(part).hasQuantity)
+  return everyPartStandsAlone ? parts.filter((part) => part.length > 0) : [segment]
+}
+
+/**
+ * Parse a spoken shopping sentence into invoice items.
+ * Returns `null` when the text does not look like an item list at all (so the caller can
+ * fall back to the single-command parser / “unknown command” message).
+ */
+export function parseSpokenItems(input: string): SpokenItemList | null {
+  const normalized = normalizeListText(input)
+  if (!normalized) return null
+  const cleaned = stripListImperatives(stripFillers(normalized))
+  if (!cleaned) return null
+
+  const segments = splitListSegments(cleaned)
+  if (segments.length === 0) return null
+
+  const parses: SegmentParse[] = []
+  for (const segment of segments) {
+    for (const part of splitOnConnectors(segment)) {
+      parses.push(parseItemSegment(part))
+    }
+  }
+
+  if (!parses.some((parse) => parse.signal)) return null
+  return { items: parses.map((parse) => parse.entry) }
+}
+
+/**
+ * Combined parse used to guard Persian ITN: a transcript may be a single command or an
+ * item list. Semantic fields only — raw segment text must not affect the comparison.
+ * For add-item text the item-list parse wins, because the single-command parser folds
+ * commas away and can misread a multi-item sentence as one item.
+ */
+export function parseSpeechText(value: string): unknown {
+  const command = parseCommand(value)
+  if (command && command.type !== 'addInvoiceItem') return command
+  const list = parseSpokenItems(value)
+  if (list) {
+    return {
+      items: list.items.map((entry) => (entry.status === 'ok'
+        ? { status: 'ok', productName: entry.productName, quantity: entry.quantity, unit: entry.unit, unitPrice: entry.unitPrice }
+        : { status: 'review', reason: entry.reason })),
+    }
+  }
+  return command
+}

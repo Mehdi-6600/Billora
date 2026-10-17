@@ -1,5 +1,5 @@
 import { applyPercentageChange } from './calculations'
-import { normalizeProductName, type ParsedCommand } from './commands'
+import { normalizeProductName, type ParsedCommand, type SpokenItemEntry } from './commands'
 import type { InvoiceLineForm } from './invoice-form'
 import type { Product } from './types'
 import { createId } from '../utils'
@@ -15,14 +15,20 @@ export type CommandPlan =
   | { kind: 'chooseProduct'; command: ParsedCommand; candidates: Product[] }
   | { kind: 'error'; message: string }
 
-function makeLine(product: Product | undefined, name: string, quantity: number, idFactory: () => string): InvoiceLineForm {
+function makeLine(
+  product: Product | undefined,
+  name: string,
+  quantity: number,
+  idFactory: () => string,
+  spoken?: { unit?: string | null; unitPrice?: number | null },
+): InvoiceLineForm {
   return {
     id: idFactory(),
     productId: product?.id ?? null,
     name: product?.name ?? name,
-    unit: product?.unit ?? 'عدد',
+    unit: product?.unit ?? spoken?.unit ?? 'عدد',
     quantity: String(quantity),
-    unitPrice: product ? String(product.price) : '0',
+    unitPrice: String(spoken?.unitPrice ?? product?.price ?? 0),
     discountPercent: '0',
   }
 }
@@ -80,4 +86,59 @@ export function planCommand(
   }
   if (matches.length > 0) return { kind: 'chooseProduct', command, candidates: matches }
   return { kind: 'error', message: `محصولی با نام «${command.productName}» در فهرست نیست. نام دقیق محصول را بررسی کنید.` }
+}
+
+export interface PlannedSpokenLine {
+  raw: string
+  line: InvoiceLineForm
+  catalogProductFound: boolean
+  priceSource: 'speech' | 'catalog'
+}
+
+export interface SpokenItemIssue {
+  raw: string
+  reason: string
+}
+
+export interface SpokenItemsPlan {
+  planned: PlannedSpokenLine[]
+  issues: SpokenItemIssue[]
+}
+
+/**
+ * Resolve a spoken item list against the catalog. Spoken prices win over catalog prices.
+ * An item with neither (or with a parse problem) becomes an `issue` — it must be shown to
+ * the user for correction instead of being registered with a guessed price.
+ */
+export function planSpokenItems(
+  items: SpokenItemEntry[],
+  products: Product[],
+  idFactory: () => string = createId,
+): SpokenItemsPlan {
+  const planned: PlannedSpokenLine[] = []
+  const issues: SpokenItemIssue[] = []
+
+  for (const entry of items) {
+    if (entry.status === 'review') {
+      issues.push({ raw: entry.raw, reason: entry.reason })
+      continue
+    }
+    const product = products.find((candidate) => normalizeProductName(candidate.name) === normalizeProductName(entry.productName))
+    const priceSource: 'speech' | 'catalog' | null = entry.unitPrice !== null ? 'speech' : product ? 'catalog' : null
+    if (priceSource === null) {
+      issues.push({
+        raw: entry.raw,
+        reason: `قیمت «${entry.productName}» معلوم نیست و در فهرست محصولات هم نیست؛ قیمت را در متن بگویید (مثلاً «به قیمت ۲۵۰۰۰۰») یا محصول را در فهرست ثبت کنید.`,
+      })
+      continue
+    }
+    planned.push({
+      raw: entry.raw,
+      line: makeLine(product, entry.productName, entry.quantity, idFactory, { unit: entry.unit, unitPrice: entry.unitPrice }),
+      catalogProductFound: Boolean(product),
+      priceSource,
+    })
+  }
+
+  return { planned, issues }
 }

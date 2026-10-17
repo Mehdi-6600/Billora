@@ -106,7 +106,7 @@ describe('ورود گفتاری در فرم فاکتور', () => {
       recognition.emitResult('سه عدد شیر به فاکتور اضافه کن')
     })
     expect(container.querySelector<HTMLInputElement>('[aria-label="نوشتن دستور فارسی"]')?.value).toBe('سه عدد شیر به فاکتور اضافه کن')
-    expect(container.textContent).toContain('تا وقتی «اجرای دستور» را نزنید تغییری انجام نمی‌شود')
+    expect(container.textContent).toContain('تا وقتی «ثبت» را نزنید تغییری انجام نمی‌شود')
     expect(props.onChange).not.toHaveBeenCalled()
     expect(props.onSave).not.toHaveBeenCalled()
     expect(props.onUpdateProduct).not.toHaveBeenCalled()

@@ -162,7 +162,7 @@ describe('useOfflineSpeech: چرخهٔ کامل موتور آفلاین', () => 
     expect(onTranscript).toHaveBeenCalledWith('[سه عدد شیر به فاکتور اضافه کن]')
     expect(latest!.status).toBe('result')
     expect(latest!.metrics).toMatchObject({ tokens: 6 })
-    expect(latest!.message).toContain('اجرای دستور')
+    expect(latest!.message).toContain('ثبت')
   })
 
   it('کلیک دوم روی دکمه، ضبط را متوقف می‌کند', async () => {

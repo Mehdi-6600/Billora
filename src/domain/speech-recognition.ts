@@ -214,7 +214,7 @@ export class PersianSpeechSession {
         }
         this.publishStatus('result')
         this.callbacks.onTranscript(transcript)
-        this.publishMessage('متن شنیده‌شده را بازبینی کنید؛ تا وقتی «اجرای دستور» را نزنید تغییری انجام نمی‌شود.')
+        this.publishMessage('متن شنیده‌شده را بازبینی کنید؛ تا وقتی «ثبت» را نزنید تغییری انجام نمی‌شود.')
       }
       recognition.onerror = (event) => {
         if (!this.isCurrent(recognition)) return
