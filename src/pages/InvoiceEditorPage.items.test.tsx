@@ -176,3 +176,109 @@ describe('دکمهٔ «ثبت» و مسیرهای قبلی', () => {
     expect(updated.items).toHaveLength(1)
   })
 })
+
+describe('نام تنها کالا: ثبت سریع یا پنل تکمیل قیمت (با واژه‌های تازه)', () => {
+  const setNativeValue = (element: HTMLInputElement, value: string) => {
+    const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value')?.set
+    act(() => {
+      setter?.call(element, value)
+      element.dispatchEvent(new Event('input', { bubbles: true }))
+    })
+  }
+  const reviewButton = (container: HTMLElement, text: string) =>
+    [...container.querySelector<HTMLElement>('[role="alert"]')!.querySelectorAll<HTMLButtonElement>('button')].find((button) => button.textContent?.trim() === text)!
+  const feedback = (container: HTMLElement) => container.querySelector<HTMLElement>('[role="status"]')?.textContent ?? ''
+  const reviewInput = (container: HTMLElement, label: string) =>
+    container.querySelector<HTMLInputElement>(`[aria-label="${label}"]`)!
+  const reviewName = (container: HTMLElement, row: number) => reviewInput(container, `نام قلم ${row} در بازبینی`)
+  const reviewQty = (container: HTMLElement, row: number) => reviewInput(container, `تعداد قلم ${row} در بازبینی`)
+  const reviewPrice = (container: HTMLElement, row: number) => reviewInput(container, `قیمت قلم ${row} در بازبینی`)
+
+  it('نام تنها با تطبیق دقیقِ کاتالوگ، بلافاصله با تعداد ۱ ثبت می‌شود', () => {
+    const saffron: Product = { id: 'p-saffron', name: 'زعفران', unit: 'بسته', price: 1_800_000, createdAt: now, updatedAt: now }
+    const { container, props } = renderEditor([saffron])
+    typeCommand(container, 'زعفران')
+    pressRegister(container)
+    expect(props.onChange).toHaveBeenCalledTimes(1)
+    const form = props.onChange.mock.calls[0][0] as InvoiceForm
+    expect(form.items).toHaveLength(1)
+    expect(form.items[0]).toMatchObject({ productId: 'p-saffron', name: 'زعفران', quantity: '1', unitPrice: '1800000', discountPercent: '0' })
+    expect(feedback(container)).toContain('۱ قلم در فاکتور ثبت شد')
+    expect(container.querySelector<HTMLInputElement>('[aria-label="نوشتن دستور فارسی"]')?.value).toBe('')
+  })
+
+  it('نام تنها بدون قیمت، پنل تکمیل باز می‌کند؛ با پرکردن قیمت و «ثبت اقلام»، قلم با تعداد ۱ ثبت می‌شود', () => {
+    const { container, props } = renderEditor([])
+    typeCommand(container, 'ماکارونی')
+    pressRegister(container)
+    expect(props.onChange).not.toHaveBeenCalled()
+    const alert = container.querySelector<HTMLElement>('[role="alert"]')
+    expect(alert?.textContent).toContain('ماکارونی')
+    expect(alert?.textContent).toContain('هنوز چیزی ثبت نشده است')
+    setNativeValue(reviewPrice(container, 1), '250000')
+    act(() => { reviewButton(container, 'ثبت اقلام').click() })
+    const form = props.onChange.mock.calls[0][0] as InvoiceForm
+    expect(form.items).toHaveLength(1)
+    expect(form.items[0]).toMatchObject({ name: 'ماکارونی', quantity: '1', unitPrice: '250000' })
+    expect(container.querySelector('[role="alert"]')).toBeNull()
+    expect(feedback(container)).toContain('۱ قلم در فاکتور ثبت شد')
+  })
+
+  it('دو نام تنها، دو ردیف تکمیل می‌شوند و هر دو با «ثبت اقلام» ثبت می‌شوند', () => {
+    const { container, props } = renderEditor([])
+    typeCommand(container, 'شکر، قند')
+    pressRegister(container)
+    expect(reviewName(container, 1).value).toBe('شکر')
+    expect(reviewName(container, 2).value).toBe('قند')
+    setNativeValue(reviewPrice(container, 1), '45000')
+    setNativeValue(reviewPrice(container, 2), '52000')
+    act(() => { reviewButton(container, 'ثبت اقلام').click() })
+    const form = props.onChange.mock.calls[0][0] as InvoiceForm
+    expect(form.items).toHaveLength(2)
+    expect(form.items[0]).toMatchObject({ name: 'شکر', quantity: '1', unitPrice: '45000' })
+    expect(form.items[1]).toMatchObject({ name: 'قند', quantity: '1', unitPrice: '52000' })
+  })
+
+  it('نام و تعداد در پنل قابل اصلاح است (تعداد پیش‌فرض ۱ حدس پنهان نیست)', () => {
+    const { container, props } = renderEditor([])
+    typeCommand(container, 'سیب‌زمینی')
+    pressRegister(container)
+    expect(reviewQty(container, 1).value).toBe('1')
+    setNativeValue(reviewQty(container, 1), '3')
+    setNativeValue(reviewName(container, 1), 'سیب‌زمینی سرخ‌کرده')
+    setNativeValue(reviewPrice(container, 1), '80000')
+    act(() => { reviewButton(container, 'ثبت اقلام').click() })
+    const form = props.onChange.mock.calls[0][0] as InvoiceForm
+    expect(form.items[0]).toMatchObject({ name: 'سیب‌زمینی سرخ‌کرده', quantity: '3', unitPrice: '80000' })
+  })
+
+  it('قیمتِ تطبیق دقیقِ کاتالوگ هنگام تایپ نام، خودکار پر می‌شود', () => {
+    const whiteSugar: Product = { id: 'p-white-sugar', name: 'شکر سفید', unit: 'کیلو', price: 40_000, createdAt: now, updatedAt: now }
+    const brownSugar: Product = { id: 'p-brown-sugar', name: 'شکر قهوه‌ای', unit: 'کیلو', price: 55_000, createdAt: now, updatedAt: now }
+    const { container, props } = renderEditor([whiteSugar, brownSugar])
+    typeCommand(container, 'شکر')
+    pressRegister(container)
+    // دو تطبیق جزئی و بدون تطبیق دقیق → ابهام؛ حدس زده نمی‌شود
+    const alert = container.querySelector<HTMLElement>('[role="alert"]')
+    expect(alert?.textContent).toContain('چند محصول مشابه')
+    expect(alert?.textContent).toContain('شکر قهوه‌ای')
+    setNativeValue(reviewName(container, 1), 'شکر قهوه‌ای')
+    expect(reviewPrice(container, 1).value).toBe('55000')
+    act(() => { reviewButton(container, 'ثبت اقلام').click() })
+    const form = props.onChange.mock.calls[0][0] as InvoiceForm
+    expect(form.items[0]).toMatchObject({ productId: 'p-brown-sugar', name: 'شکر قهوه‌ای', quantity: '1', unitPrice: '55000' })
+  })
+
+  it('«انصراف» هیچ قلمی ثبت نمی‌کند و «ثبت اقلام» بدون قیمت، پیام اصلاح می‌دهد', () => {
+    const { container, props } = renderEditor([])
+    typeCommand(container, 'ماکارونی')
+    pressRegister(container)
+    act(() => { reviewButton(container, 'ثبت اقلام').click() })
+    expect(props.onChange).not.toHaveBeenCalled()
+    expect(feedback(container)).toContain('قیمت واحد را به‌صورت عدد صحیح')
+    act(() => { reviewButton(container, 'انصراف').click() })
+    expect(props.onChange).not.toHaveBeenCalled()
+    expect(feedback(container)).toContain('ثبت اقلام لغو شد.')
+    expect(container.querySelector('[role="alert"]')).toBeNull()
+  })
+})

@@ -188,7 +188,9 @@ describe('ورود گفتاری در فرم فاکتور', () => {
       commandInput.dispatchEvent(new Event('input', { bubbles: true }))
     })
     act(() => { commandRunButton.click() })
-    expect(feedback()).toContain('این دستور را نمی‌شناسم')
+    // نام تنها، قلم است — ولی چون قیمت ندارد، برای تکمیل نشان داده می‌شود (نه «نمی‌شناسم»)
+    expect(feedback()).toContain('این دستور ناشناخته است')
+    expect(feedback()).not.toContain('این دستور را نمی‌شناسم')
 
     act(() => { firstRecognition.emitEnd() })
     act(() => { micButton.dispatchEvent(new MouseEvent('click', { bubbles: true })) })
@@ -378,7 +380,7 @@ describe('دکمهٔ گفتار: توقف، بازیابی و خطای دستو�
     expect(props.onChange).not.toHaveBeenCalled()
   })
 
-  it('عبارت شناخته‌نشده را با متن شنیده‌شده نشان می‌دهد و فاکتور را تغییر نمی‌دهد', () => {
+  it('عبارت نامشخص را با متن شنیده‌شده برای تکمیل نشان می‌دهد و فاکتور را تغییر نمی‌دهد', () => {
     setSpeechConstructors(MockRecognition)
     const { container, props } = renderEditor([rice])
     press(voiceButton(container))
@@ -389,9 +391,13 @@ describe('دکمهٔ گفتار: توقف، بازیابی و خطای دستو�
     })
     act(() => { container.querySelector<HTMLButtonElement>('.command-run')?.click() })
     const feedback = container.querySelector<HTMLElement>('[role="status"]')?.textContent ?? ''
-    expect(feedback).toContain('این دستور را نمی‌شناسم')
+    // نام تنها قلم است؛ چون قیمت ندارد، پنل تکمیل باز می‌شود — نه «نمی‌شناسم»
     expect(feedback).toContain('این دستور ناشناخته است')
+    expect(feedback).not.toContain('این دستور را نمی‌شناسم')
     expect(feedback).not.toContain('خطای')
+    const review = container.querySelector<HTMLElement>('[role="alert"]')
+    expect(review?.textContent).toContain('این دستور ناشناخته است')
+    expect(review?.textContent).toContain('هنوز چیزی ثبت نشده است')
     expect(props.onChange).not.toHaveBeenCalled()
     expect(container.querySelector<HTMLInputElement>('[aria-label="نوشتن دستور فارسی"]')?.value).toBe('این دستور ناشناخته است')
   })
