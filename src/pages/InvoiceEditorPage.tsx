@@ -17,8 +17,8 @@ import {
   X,
 } from 'lucide-react'
 import { calculateInvoiceTotals, calculateLineAmounts, formatNumber, formatToman, parseLocalizedNumber } from '../domain/calculations'
-import { normalizeProductName, parseCommand, parseSpeechText, parseSpokenItems, supportedCommandExamples, type ParsedCommand, type SpokenItemEntry } from '../domain/commands'
-import { planCommand, planSpokenItems, productConfirmation, type PlannedSpokenLine, type ProductCommandAction, type SpokenItemIssue } from '../domain/command-execution'
+import { normalizeProductName, parseCommand, parseSpeechText, parseSpokenItems, supportedCommandExamples, type ParsedCommand } from '../domain/commands'
+import { matchProduct, planCommand, planSpokenItems, productConfirmation, spokenRowToLine, type ProductCommandAction } from '../domain/command-execution'
 import { PersianSpeechSession, getSpeechRecognitionConstructor, type SpeechStatus } from '../domain/speech-recognition'
 import { resolveActiveEngine, detectIosLike, type SpeechEnginePreference } from '../speech/offline/engineSelection'
 import { OFFLINE_SPEECH_MESSAGES } from '../speech/offline/offlineSpeechMessages'
@@ -56,11 +56,19 @@ type PendingAction = ProductCommandAction
 
 type TargetPrompt = { command: ParsedCommand; candidates: Product[] }
 
-/** Ambiguous spoken items kept on screen so the user can correct the text — nothing is registered. */
-type ItemReview = {
-  entries: SpokenItemEntry[]
-  planned: PlannedSpokenLine[]
-  issues: SpokenItemIssue[]
+/**
+ * Rows of the completion panel: when a spoken item is not fully specified (no price,
+ * ambiguous name, unclear text), nothing is registered — the user completes these fields
+ * and presses «ثبت اقلام».
+ */
+type ReviewRow = {
+  raw: string
+  name: string
+  quantity: string
+  unitPrice: string
+  unit: string | null
+  reason: string | null
+  candidates: string
 }
 
 export function InvoiceEditorPage({
@@ -96,7 +104,7 @@ export function InvoiceEditorPage({
   const [pending, setPending] = useState<PendingAction | null>(null)
   const [targetPrompt, setTargetPrompt] = useState<TargetPrompt | null>(null)
   const [targetId, setTargetId] = useState('')
-  const [itemReview, setItemReview] = useState<ItemReview | null>(null)
+  const [reviewRows, setReviewRows] = useState<ReviewRow[] | null>(null)
   const [speechStatus, setSpeechStatus] = useState<SpeechStatus>('idle')
   const [webSpeechServiceUnavailable, setWebSpeechServiceUnavailable] = useState(false)
   const [enginePreference, setEnginePreference] = useState<SpeechEnginePreference>('auto')
@@ -112,6 +120,7 @@ export function InvoiceEditorPage({
     onTranscript: (transcript) => {
       offlineSpeech?.onTranscript?.(transcript)
       setCommandText(transcript)
+      setReviewRows(null)
       setCommandMessage(OFFLINE_SPEECH_MESSAGES.done)
     },
     transformTranscript: offlineSpeech?.transformTranscript ?? ((transcript) => itnForCommand(transcript, parseSpeechText)),
@@ -125,7 +134,10 @@ export function InvoiceEditorPage({
         if (message.includes('service-not-allowed')) setWebSpeechServiceUnavailable(true)
         setCommandMessage(message)
       },
-      onTranscript: (transcript) => setCommandText(transcript),
+      onTranscript: (transcript) => {
+        setCommandText(transcript)
+        setReviewRows(null)
+      },
     })
     recognitionRef.current = session
     return () => {
@@ -180,7 +192,7 @@ export function InvoiceEditorPage({
   const runCommand = () => {
     setPending(null)
     setTargetPrompt(null)
-    setItemReview(null)
+    setReviewRows(null)
     setCommandMessage('')
     const trimmed = commandText.trim()
     cmdLog('run:click', { input: trimmed, itemsBefore: form.items.length, products: products.length })
@@ -192,37 +204,46 @@ export function InvoiceEditorPage({
     const command = parseCommand(trimmed)
     cmdLog('run:parse', { parsed: command ? JSON.stringify(command) : null })
 
-    // Spoken item lists («دو تا لنت …، چهار تا لاستیک …، یک جفت چراغ …») are the add-item
-    // path: one or more items with quantity / spoken price. They may not parse as a single
-    // command, so try them before the single-command plan below.
+    // Spoken item lists («دو تا لنت …، چهار تا لاستیک …، یک جفت چراغ …») and bare product
+    // names («شکر» = ۱ عدد) are the add-item path. They may not parse as a single command,
+    // so try them before the single-command plan below.
     if (!command || command.type === 'addInvoiceItem') {
       const list = parseSpokenItems(trimmed)
       if (list) {
-        const itemPlan = planSpokenItems(list.items, products)
-        cmdLog('run:items', { count: list.items.length, issues: itemPlan.issues.length })
-        if (itemPlan.issues.length > 0) {
-          // Ambiguous items are shown for correction; nothing is guessed, nothing is registered.
-          cmdLog('run:items:review', { issues: itemPlan.issues.map((issue) => issue.raw).join('|') })
-          setItemReview({ entries: list.items, planned: itemPlan.planned, issues: itemPlan.issues })
-          setCommandMessage('چیزی ثبت نشد؛ بخش‌های مبهم را اصلاح کنید و دوباره «ثبت» را بزنید.')
+        const rows = planSpokenItems(list.items, products)
+        const allReady = rows.every((row) => row.reason === null)
+        cmdLog('run:items', { count: rows.length, ready: rows.filter((row) => row.reason === null).length })
+        if (allReady) {
+          const lines = rows.map((row) => spokenRowToLine(row, createId))
+          const nextForm = { ...form, items: [...form.items, ...lines] }
+          cmdLog('run:items:commit', { itemsAfter: nextForm.items.length, count: lines.length })
+          onChange(nextForm)
+          const parts = lines.map((line) => {
+            const quantity = parseLocalizedNumber(line.quantity) ?? 0
+            const unitPrice = parseLocalizedNumber(line.unitPrice) ?? 0
+            return `${formatNumber(quantity)} ${line.unit} ${line.name} — قیمت واحد ${formatToman(unitPrice)}`
+          })
+          const addedSum = lines.reduce((sum, line) => {
+            const quantity = parseLocalizedNumber(line.quantity) ?? 0
+            const unitPrice = parseLocalizedNumber(line.unitPrice) ?? 0
+            return sum + quantity * unitPrice
+          }, 0)
+          setCommandMessage(`${formatNumber(lines.length)} قلم در فاکتور ثبت شد: ${parts.join('؛ ')}. جمع مبلغ این اقلام: ${formatToman(addedSum)}.`)
+          setCommandText('')
           return
         }
-        const lines = itemPlan.planned.map((entry) => entry.line)
-        const nextForm = { ...form, items: [...form.items, ...lines] }
-        cmdLog('run:items:commit', { itemsAfter: nextForm.items.length, count: lines.length })
-        onChange(nextForm)
-        const parts = itemPlan.planned.map((entry) => {
-          const quantity = parseLocalizedNumber(entry.line.quantity) ?? 0
-          const unitPrice = parseLocalizedNumber(entry.line.unitPrice) ?? 0
-          return `${formatNumber(quantity)} ${entry.line.unit} ${entry.line.name} — قیمت واحد ${formatToman(unitPrice)}`
-        })
-        const addedSum = itemPlan.planned.reduce((sum, entry) => {
-          const quantity = parseLocalizedNumber(entry.line.quantity) ?? 0
-          const unitPrice = parseLocalizedNumber(entry.line.unitPrice) ?? 0
-          return sum + quantity * unitPrice
-        }, 0)
-        setCommandMessage(`${formatNumber(lines.length)} قلم در فاکتور ثبت شد: ${parts.join('؛ ')}. جمع مبلغ این اقلام: ${formatToman(addedSum)}.`)
-        setCommandText('')
+        // Incomplete / ambiguous items are shown for completion; nothing is guessed, nothing is registered.
+        cmdLog('run:items:review', { rows: rows.map((row) => row.raw).join('|') })
+        setReviewRows(rows.map((row) => ({
+          raw: row.raw,
+          name: row.productName,
+          quantity: String(row.quantity),
+          unitPrice: row.unitPrice !== null ? String(row.unitPrice) : '',
+          unit: row.unit,
+          reason: row.reason,
+          candidates: row.candidates.map((candidate) => candidate.name).join('، '),
+        })))
+        setCommandMessage(`«${trimmed}» هنوز برای ثبت کامل نیست؛ مقادیر خواسته‌شده را در جعبهٔ پایین وارد کنید و «ثبت اقلام» را بزنید.`)
         return
       }
       if (!command) {
@@ -314,6 +335,73 @@ export function InvoiceEditorPage({
     } finally {
       setBusy(false)
     }
+  }
+
+  const updateReviewRow = (index: number, changes: Partial<ReviewRow>) => {
+    setReviewRows((current) => {
+      if (!current) return current
+      return current.map((row, rowIndex) => {
+        if (rowIndex !== index) return row
+        const next = { ...row, ...changes }
+        // Typing an exact catalog name fills the price in, so completion is faster.
+        if (changes.name !== undefined && !next.unitPrice.trim()) {
+          const match = matchProduct(changes.name, products)
+          if (match.matchKind === 'exact' && match.product) next.unitPrice = String(match.product.price)
+        }
+        return next
+      })
+    })
+    setCommandMessage('')
+  }
+
+  const applyReviewRows = () => {
+    if (!reviewRows) return
+    const problems: string[] = []
+    const lines: InvoiceLineForm[] = []
+    reviewRows.forEach((row, index) => {
+      const label = `ردیف ${formatNumber(index + 1)}`
+      const name = row.name.trim()
+      const quantity = parseLocalizedNumber(row.quantity)
+      const match = matchProduct(name, products)
+      let unitPrice = parseLocalizedNumber(row.unitPrice)
+      if (unitPrice === null && match.product) unitPrice = match.product.price
+      if (!name) {
+        problems.push(`${label}: نام کالا را وارد کنید.`)
+        return
+      }
+      if (quantity === null || quantity <= 0) {
+        problems.push(`${label}: تعداد باید بزرگ‌تر از صفر باشد.`)
+        return
+      }
+      if (unitPrice === null || unitPrice < 0 || !Number.isSafeInteger(unitPrice)) {
+        problems.push(`${label}: قیمت واحد را به‌صورت عدد صحیح (تومان) وارد کنید.`)
+        return
+      }
+      lines.push({
+        id: createId(),
+        productId: match.product?.id ?? null,
+        name: match.product?.name ?? name,
+        unit: match.product?.unit ?? row.unit ?? 'عدد',
+        quantity: String(quantity),
+        unitPrice: String(unitPrice),
+        discountPercent: '0',
+      })
+    })
+    if (problems.length > 0) {
+      cmdLog('run:items:review:invalid', { problems: problems.join('|') })
+      setCommandMessage(problems.join(' '))
+      return
+    }
+    onChange({ ...form, items: [...form.items, ...lines] })
+    cmdLog('run:items:review:commit', { count: lines.length, itemsAfter: form.items.length + lines.length })
+    const addedSum = lines.reduce((sum, line) => {
+      const quantity = parseLocalizedNumber(line.quantity) ?? 0
+      const unitPrice = parseLocalizedNumber(line.unitPrice) ?? 0
+      return sum + quantity * unitPrice
+    }, 0)
+    setCommandMessage(`${formatNumber(lines.length)} قلم در فاکتور ثبت شد: ${lines.map((line) => `${formatNumber(parseLocalizedNumber(line.quantity) ?? 0)} ${line.unit} ${line.name} — قیمت واحد ${formatToman(parseLocalizedNumber(line.unitPrice) ?? 0)}`).join('؛ ')}. جمع مبلغ این اقلام: ${formatToman(addedSum)}.`)
+    setReviewRows(null)
+    setCommandText('')
   }
 
   const startListening = () => recognitionRef.current?.start()
@@ -497,7 +585,7 @@ export function InvoiceEditorPage({
       <section className="command-panel panel">
         <div className="command-heading"><span className="command-heading-icon"><Sparkles size={18} /></span><div><span className="panel-kicker">پردازش محلی · بدون API هوش مصنوعی</span><h2>دستور متنی فارسی</h2><p>برای فاکتور یا فهرست محصولات، یکی از دستورهای مشخص را بنویسید.</p></div></div>
         <div className="command-input-row">
-          <input value={commandText} onChange={(event) => { setCommandText(event.target.value); setCommandMessage(''); setItemReview(null) }} onKeyDown={(event) => { if (event.key === 'Enter' && !event.shiftKey) { event.preventDefault(); runCommand() } }} placeholder="مثلاً: سه عدد شیر به فاکتور اضافه کن" aria-label="نوشتن دستور فارسی" enterKeyHint="send" />
+          <input value={commandText} onChange={(event) => { setCommandText(event.target.value); setCommandMessage(''); setReviewRows(null) }} onKeyDown={(event) => { if (event.key === 'Enter' && !event.shiftKey) { event.preventDefault(); runCommand() } }} placeholder="مثلاً: سه عدد شیر به فاکتور اضافه کن" aria-label="نوشتن دستور فارسی" enterKeyHint="send" />
           <button type="button" className={`voice-button${offlineActive ? ' offline-voice-button' : ''}${micButtonListening ? ' listening' : ''}${micButtonError ? ' speech-error' : ''}${micButtonComplete ? ' speech-complete' : ''}`} onClick={handleMicClick} disabled={micButtonDisabled} aria-label={micButtonLabel} title={offlineActive ? 'دکمهٔ میکروفن — گفتار روی همین دستگاه پردازش می‌شود' : 'دکمهٔ میکروفن — گفتار با سرویس مرورگر پردازش می‌شود'}>{micButtonBusy ? <MicOff size={17} /> : micButtonComplete ? <Check size={17} /> : <Mic size={17} />}<span>{micButtonText}</span></button>
           <button type="button" className="button button-primary command-run" title="اجرای دستور" onClick={runCommand}>ثبت</button>
         </div>
@@ -522,22 +610,26 @@ export function InvoiceEditorPage({
           ? 'صدا روی همین دستگاه پردازش می‌شود و به اینترنت فرستاده نمی‌شود. متن شنیده‌شده خودکار اجرا نمی‌شود و قبل از «ثبت» قابل ویرایش است.'
           : 'تشخیص گفتار با سرویس گفتار مرورگر انجام می‌شود؛ ممکن است به اینترنت نیاز داشته باشد. متن شنیده‌شده خودکار اجرا نمی‌شود.'}</p>
         {commandMessage && <div className="command-feedback" role="status"><CircleHelp size={16} />{commandMessage}</div>}
-        {itemReview && (
-          <div className="command-confirmation is-danger" role="alert">
-            <span className="confirm-icon"><AlertTriangle size={18} /></span>
-            <div className="confirm-copy">
-              <strong>این موارد روشن نیستند؛ متن را اصلاح کنید و دوباره «ثبت» را بزنید (چیزی ثبت نشده است):</strong>
-              {itemReview.issues.map((issue, index) => (
-                <span key={`issue-${index}`}>نیاز به اصلاح: «{issue.raw}» — {issue.reason}</span>
-              ))}
-              {itemReview.planned.map((entry) => (
-                <span key={entry.line.id}>آماده برای ثبت: «{entry.raw}» — {formatNumber(parseLocalizedNumber(entry.line.quantity) ?? 0)} {entry.line.unit} {entry.line.name} · قیمت واحد {formatToman(parseLocalizedNumber(entry.line.unitPrice) ?? 0)}</span>
-              ))}
+        {reviewRows && (
+          <div className="command-review" role="alert">
+            <div className="command-review-head"><AlertTriangle size={16} /> این موارد را کامل کنید و «ثبت اقلام» را بزنید (هنوز چیزی ثبت نشده است):</div>
+            {reviewRows.map((row, index) => (
+              <div className="command-review-item" key={`review-${index}`}>
+                {row.reason && <div className="command-review-reason">«{row.raw}» — {row.reason}{row.candidates ? ` (مشابه‌ها: ${row.candidates})` : ''}</div>}
+                <div className="command-review-row">
+                  <label className="field"><span>شرح کالا</span><input maxLength={160} value={row.name} onChange={(event) => updateReviewRow(index, { name: event.target.value })} aria-label={`نام قلم ${index + 1} در بازبینی`} placeholder="نام محصول" /></label>
+                  <label className="field"><span>تعداد</span><input dir="ltr" inputMode="decimal" value={row.quantity} onChange={(event) => updateReviewRow(index, { quantity: event.target.value })} aria-label={`تعداد قلم ${index + 1} در بازبینی`} /></label>
+                  <label className="field"><span>قیمت واحد · تومان</span><input dir="ltr" inputMode="numeric" value={row.unitPrice} onChange={(event) => updateReviewRow(index, { unitPrice: event.target.value })} aria-label={`قیمت قلم ${index + 1} در بازبینی`} /></label>
+                </div>
+              </div>
+            ))}
+            <div className="command-review-actions">
+              <button type="button" className="button button-primary" onClick={applyReviewRows}>ثبت اقلام</button>
+              <button type="button" className="button button-quiet" onClick={() => { setReviewRows(null); setCommandMessage('ثبت اقلام لغو شد.') }}>انصراف</button>
             </div>
-            <button type="button" className="icon-button" aria-label="بستن بازبینی اقلام" onClick={() => setItemReview(null)}><X size={17} /></button>
           </div>
         )}
-        <div className="command-examples"><span>نمونه‌ها:</span>{supportedCommandExamples.map((example) => <button type="button" key={example} onClick={() => { setCommandText(example); setCommandMessage('') }}>{example}</button>)}</div>
+        <div className="command-examples"><span>نمونه‌ها:</span>{supportedCommandExamples.map((example) => <button type="button" key={example} onClick={() => { setCommandText(example); setCommandMessage(''); setReviewRows(null) }}>{example}</button>)}</div>
 
         {targetPrompt && (
           <div className="command-target-picker">

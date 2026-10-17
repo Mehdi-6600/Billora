@@ -15,20 +15,14 @@ export type CommandPlan =
   | { kind: 'chooseProduct'; command: ParsedCommand; candidates: Product[] }
   | { kind: 'error'; message: string }
 
-function makeLine(
-  product: Product | undefined,
-  name: string,
-  quantity: number,
-  idFactory: () => string,
-  spoken?: { unit?: string | null; unitPrice?: number | null },
-): InvoiceLineForm {
+function makeLine(product: Product | undefined, name: string, quantity: number, idFactory: () => string): InvoiceLineForm {
   return {
     id: idFactory(),
     productId: product?.id ?? null,
     name: product?.name ?? name,
-    unit: product?.unit ?? spoken?.unit ?? 'عدد',
+    unit: product?.unit ?? 'عدد',
     quantity: String(quantity),
-    unitPrice: String(spoken?.unitPrice ?? product?.price ?? 0),
+    unitPrice: product ? String(product.price) : '0',
     discountPercent: '0',
   }
 }
@@ -100,45 +94,92 @@ export interface SpokenItemIssue {
   reason: string
 }
 
-export interface SpokenItemsPlan {
-  planned: PlannedSpokenLine[]
-  issues: SpokenItemIssue[]
+export interface ProductMatch {
+  product: Product | null
+  matchKind: 'exact' | 'partial' | 'none' | 'ambiguous'
+  candidates: Product[]
+}
+
+/** Exact catalog name wins; a unique partial match is accepted; several matches are ambiguous. */
+export function matchProduct(name: string, products: Product[]): ProductMatch {
+  const normalized = normalizeProductName(name)
+  if (!normalized) return { product: null, matchKind: 'none', candidates: [] }
+  const exact = products.filter((product) => normalizeProductName(product.name) === normalized)
+  if (exact.length > 0) return { product: exact[0]!, matchKind: 'exact', candidates: exact }
+  const partial = products.filter((product) => {
+    const candidate = normalizeProductName(product.name)
+    return candidate.includes(normalized) || normalized.includes(candidate)
+  })
+  if (partial.length === 1) return { product: partial[0]!, matchKind: 'partial', candidates: partial }
+  if (partial.length > 1) return { product: null, matchKind: 'ambiguous', candidates: partial }
+  return { product: null, matchKind: 'none', candidates: [] }
+}
+
+export interface SpokenItemRow {
+  raw: string
+  productName: string
+  quantity: number
+  unit: string | null
+  /** Known unit price (spoken or catalog); `null` = the user must supply it. */
+  unitPrice: number | null
+  product: Product | null
+  matchKind: 'exact' | 'partial' | 'none' | 'ambiguous'
+  candidates: Product[]
+  /** `null` when the row is ready to register; otherwise why the user must complete it. */
+  reason: string | null
 }
 
 /**
  * Resolve a spoken item list against the catalog. Spoken prices win over catalog prices.
- * An item with neither (or with a parse problem) becomes an `issue` — it must be shown to
- * the user for correction instead of being registered with a guessed price.
+ * A row with `reason !== null` needs user input (missing price, ambiguous name, parse problem)
+ * and must be completed in the review panel instead of being registered with a guessed price.
  */
-export function planSpokenItems(
-  items: SpokenItemEntry[],
-  products: Product[],
-  idFactory: () => string = createId,
-): SpokenItemsPlan {
-  const planned: PlannedSpokenLine[] = []
-  const issues: SpokenItemIssue[] = []
-
-  for (const entry of items) {
+export function planSpokenItems(items: SpokenItemEntry[], products: Product[]): SpokenItemRow[] {
+  return items.map((entry) => {
     if (entry.status === 'review') {
-      issues.push({ raw: entry.raw, reason: entry.reason })
-      continue
-    }
-    const product = products.find((candidate) => normalizeProductName(candidate.name) === normalizeProductName(entry.productName))
-    const priceSource: 'speech' | 'catalog' | null = entry.unitPrice !== null ? 'speech' : product ? 'catalog' : null
-    if (priceSource === null) {
-      issues.push({
+      return {
         raw: entry.raw,
-        reason: `قیمت «${entry.productName}» معلوم نیست و در فهرست محصولات هم نیست؛ قیمت را در متن بگویید (مثلاً «به قیمت ۲۵۰۰۰۰») یا محصول را در فهرست ثبت کنید.`,
-      })
-      continue
+        productName: '',
+        quantity: 1,
+        unit: null,
+        unitPrice: null,
+        product: null,
+        matchKind: 'none' as const,
+        candidates: [],
+        reason: entry.reason,
+      }
     }
-    planned.push({
+    const match = matchProduct(entry.productName, products)
+    const unitPrice = entry.unitPrice ?? match.product?.price ?? null
+    let reason: string | null = null
+    if (match.matchKind === 'ambiguous') {
+      reason = `چند محصول مشابه «${entry.productName}» پیدا شد (${match.candidates.map((candidate) => candidate.name).join('، ')})؛ نام دقیق را وارد کنید.`
+    } else if (unitPrice === null) {
+      reason = `قیمت «${entry.productName}» معلوم نیست؛ قیمت را وارد کنید یا محصول را در فهرست محصولات ثبت کنید.`
+    }
+    return {
       raw: entry.raw,
-      line: makeLine(product, entry.productName, entry.quantity, idFactory, { unit: entry.unit, unitPrice: entry.unitPrice }),
-      catalogProductFound: Boolean(product),
-      priceSource,
-    })
-  }
+      productName: entry.productName,
+      quantity: entry.quantity,
+      unit: entry.unit,
+      unitPrice,
+      product: match.product,
+      matchKind: match.matchKind,
+      candidates: match.candidates,
+      reason,
+    }
+  })
+}
 
-  return { planned, issues }
+/** Build the invoice line for a ready spoken row (spoken price wins over the catalog price). */
+export function spokenRowToLine(row: SpokenItemRow, idFactory: () => string = createId): InvoiceLineForm {
+  return {
+    id: idFactory(),
+    productId: row.product?.id ?? null,
+    name: row.product?.name ?? row.productName,
+    unit: row.product?.unit ?? row.unit ?? 'عدد',
+    quantity: String(row.quantity),
+    unitPrice: String(row.unitPrice ?? 0),
+    discountPercent: '0',
+  }
 }

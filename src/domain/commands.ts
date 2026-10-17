@@ -274,6 +274,8 @@ export type SpokenItemEntry =
       raw: string
       productName: string
       quantity: number
+      /** True when the user did not say a count and quantity defaults to 1 («شکر» = «یک عدد شکر»). */
+      implicitQuantity: boolean
       /** Real unit word («کیسه»، «بسته»، …) or `null` for counters like «تا» / «جفت». */
       unit: string | null
       /** Unit price in toman when the user said it; `null` means "use the catalog price". */
@@ -294,6 +296,25 @@ const CURRENCY_WORDS = new Set(['تومان', 'تومن'])
 const REVIEW_NO_QUANTITY = 'تعداد این قلم معلوم نیست؛ تعداد را در متن بگویید (مثلاً «دو تا …»).'
 const REVIEW_NO_NAME = 'نام کالا در این قلم معلوم نیست.'
 const REVIEW_BAD_PRICE = 'قیمت گفته‌شده برای این قلم نامعتبر است. قیمت را عددی بنویسید (مثلاً «به قیمت ۲۵۰۰۰۰»).'
+const REVIEW_NOT_ITEM = 'این بخش شبیه دستور است نه کالا؛ اگر کالا بود، نام آن را واضح بنویسید.'
+
+/**
+ * Command vocabulary (token-level, so product names containing letters like «در» are safe).
+ * Used only for the bare-name fallback: text that still carries command verbs after the
+ * imperative stripping is a failed command («نمی‌شناسم»), not a product name.
+ */
+const COMMAND_TOKENS = new Set([
+  'کن', 'کنید', 'کنین', 'کنیم', 'بده', 'بدید', 'بدهید', 'حذف', 'پاک', 'کنسل',
+  'تغییر', 'عوض', 'افزایش', 'کاهش', 'ذخیره', 'اضافه', 'اضافهه', 'وارد', 'بذار', 'بذارید',
+  'بزن', 'بزنید', 'بنویس', 'بنداز', 'انجام', 'بیار', 'شو',
+])
+const COMMAND_HEADS = new Set(['قیمت', 'تعداد', 'درصد'])
+
+function isCommandLike(text: string): boolean {
+  const tokens = text.split(/\s+/).filter(Boolean)
+  if (tokens.length > 0 && COMMAND_HEADS.has(tokens[0]!)) return true
+  return tokens.some((token) => COMMAND_TOKENS.has(token))
+}
 
 function isNumberToken(token: string): boolean {
   if (smallNumberWords[token] !== undefined || SPOKEN_SCALES.has(token)) return true
@@ -529,7 +550,21 @@ function parseItemSegment(segment: string): SegmentParse {
   const lead = quantityFromStart(price.restTokens) ?? quantityFromEnd(price.restTokens)
   const signal = Boolean(lead) || price.markerFound
   if (!lead) {
-    return { entry: { status: 'review', raw, reason: REVIEW_NO_QUANTITY }, signal, hasQuantity: false }
+    // No count was said. A plain product name («شکر»، «ماکارونی») is still an item — the
+    // quantity defaults to 1 and stays editable in the invoice row / review panel.
+    const name = cleanItemName(price.restTokens)
+    if (name && !isCommandLike(raw)) {
+      return {
+        entry: { status: 'ok', raw, productName: name, quantity: 1, implicitQuantity: true, unit: null, unitPrice: price.price },
+        signal: true,
+        hasQuantity: false,
+      }
+    }
+    if (isCommandLike(raw) && !price.markerFound) {
+      // Command verbs without a parseable command («همه کارها را انجام بده») — not an item.
+      return { entry: { status: 'review', raw, reason: REVIEW_NOT_ITEM }, signal: false, hasQuantity: false }
+    }
+    return { entry: { status: 'review', raw, reason: REVIEW_NO_QUANTITY }, signal: Boolean(name) || signal, hasQuantity: false }
   }
   const productName = cleanItemName(lead.nameTokens)
   if (!productName) {
@@ -541,6 +576,7 @@ function parseItemSegment(segment: string): SegmentParse {
       raw,
       productName,
       quantity: lead.quantity,
+      implicitQuantity: false,
       unit: lead.unit,
       unitPrice: price.price,
     },
@@ -617,7 +653,7 @@ export function parseSpeechText(value: string): unknown {
   if (list) {
     return {
       items: list.items.map((entry) => (entry.status === 'ok'
-        ? { status: 'ok', productName: entry.productName, quantity: entry.quantity, unit: entry.unit, unitPrice: entry.unitPrice }
+        ? { status: 'ok', productName: entry.productName, quantity: entry.quantity, implicitQuantity: entry.implicitQuantity, unit: entry.unit, unitPrice: entry.unitPrice }
         : { status: 'review', reason: entry.reason })),
     }
   }
